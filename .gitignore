@@ -29,8 +29,19 @@ backups/
 LOOP.md
 PLAN.md
 SPEC.md
-docs/
 
 # 设计/计划文档（但 README.md 必须进版本库）
 *.md
 !README.md
+
+# 文档库白名单（本 fork 特有，上游禁用 docs/）
+#
+# 上游把 docs/ 与全部 *.md 排除，是「工作文档不进版本库」的纪律。本 fork 例外：
+# 项目文档库需要随仓库版本化，理由与边界见 docs/AGENTS.md。
+# 放宽的只是版本控制；auths/ data/ config.json 等敏感文件仍受上方规则约束，不受影响。
+!.agents/
+!.agents/**
+!docs/
+!docs/**
+!AGENTS.md
+!CLAUDE.md
