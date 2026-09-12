@@ -36,8 +36,7 @@
     "sanitize_blacklist_fingerprints": true
   },
   "model_aliases": {
-    "deepseek-flash": "deepseek-v4.1-flash",
-    "_comment": "客户端模型名 → 上游模型名。Codex 的 models.json slug 是 deepseek-flash，上游只认 deepseek-v4.1-flash；未命中的名字原样透传"
+    "deepseek-flash": "deepseek-v4.1-flash"
   },
   "prompt": {
     "mode": "custom",

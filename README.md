@@ -169,6 +169,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
 | `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`）。官网「使用端」列按出站 UA 服务端归因；官方 WorkBuddy 桌面 UA 为 `WorkBuddy/<version>`，需要时可配 |
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
+| `model_aliases` | 空 | 客户端模型名 → 上游模型名映射（如 `{"deepseek-flash":"deepseek-v4.1-flash"}`）。未命中的名字原样透传 |
 | `prompt.mode` | `custom` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
 | `prompt.file` | 空 | 提示词文件路径；空 = 内置默认（约 2KB）；路径非空但不可读 → 启动报错 |
 | `upstash.url` / `upstash.token` | 空 | 空 = 纯内存模式（Noop 降级，功能照常） |
@@ -324,11 +325,39 @@ curl -s http://localhost:7863/v1/chat/completions \
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
 | `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式 / 非流式；请求体上限 `server.max_body_mb`（默认 8 MB） |
+| `POST /v1/responses` | Bearer（`api_key` 非空时） | OpenAI Responses API；供 Codex CLI 直连（见下） |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（动态拉取，缓存 1h；失败回落静态表 + 5min 负缓存） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分 / 冷却 / 熔断 / 在途 / 粘性；disabled 账号透出 `disabled_reason`） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
 
 > 鉴权规则：仅当 `api_key` 非空才校验 `Authorization: Bearer <api_key>`；**`api_key` 为空时上述端点直接放行**；`/healthz` 恒无鉴权。
+
+### Responses API（Codex 直连）
+
+Codex CLI 的唯一 wire protocol 已是 Responses（其 `WireApi` 枚举移除了 chat 变体），
+故新增此端点。请求转成 Chat Completions 后走既有链路——账号轮转、冷却熔断、
+会话粘性、提示词改写、thinking 注入全部复用，`/v1/responses` 与
+`/v1/chat/completions` 共用同一套账号治理与日志。
+
+Codex 侧配置：
+
+```toml
+[model_providers.custom]
+base_url = "http://127.0.0.1:7863/v1"
+wire_api = "responses"
+experimental_bearer_token = "<api_key>"
+```
+
+配合 `model_aliases`（Codex 的 slug 与上游模型名不同，见配置速查表）。
+
+三类非标准工具的转换，均在网关内完成：
+
+| Codex 工具类型 | 处理 |
+|---|---|
+| `function` | 直通 |
+| `custom`（`apply_patch`，freeform + lark 文法） | 包装为 `{"content": string}` 的 function，回程解包回 `input` 原文 |
+| `namespace`（如 `collaboration`） | 扁平化为 `ns__name`（超 64 字符哈希截断防撞名），回程拆回 `name` + `namespace` |
+| `tool_search` | 转成同名 function 供模型调用；`tool_search_output` 里的新工具收集后加入后续请求的 tools |
 
 `/healthz` 响应示例（200 / 503 同结构，仅状态码与计数变化）：
 
