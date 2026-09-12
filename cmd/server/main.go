@@ -156,6 +156,7 @@ func main() {
 		PromptMode:   cfg.Prompt.Mode,
 		PromptText:   cfg.PromptText,
 		MaxBodyBytes: int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
+		ModelAliases: cfg.ModelAliases,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

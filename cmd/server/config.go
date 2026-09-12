@@ -82,6 +82,16 @@ type Config struct {
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
 	} `json:"features"`
 
+	// ModelAliases 客户端模型名 → 上游模型名映射。
+	//
+	// 存在的理由：客户端（Codex 等）用自带的模型 slug 发请求，而上游只认它自己的
+	// 模型名。例如 Codex 的 ~/.codex/models.json 里 slug 是 "deepseek-flash"，
+	// 上游只接受 "deepseek-v4-flash"——不映射就会得到 400 code=11102
+	// "model [...] service info not found"。
+	//
+	// 未命中映射的名字原样透传（上游自行报错），非别名场景行为不变。
+	ModelAliases map[string]string `json:"model_aliases"`
+
 	Prompt struct {
 		// Mode custom（默认）= 网关用自有系统提示词替换客户端 system/developer；
 		// passthrough = 透传客户端原始 system（降级重试仍会切到 Degraded）。

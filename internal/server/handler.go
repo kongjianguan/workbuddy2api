@@ -43,6 +43,10 @@ type Config struct {
 	PromptMode string
 	// PromptText custom 模式下注入的系统提示词文本（来自 config.PromptText）。
 	PromptText string
+
+	// ModelAliases 客户端模型名 → 上游模型名映射。
+	// 客户端（Codex 等）用自带 slug，上游只认自己的模型名；未命中则原样透传。
+	ModelAliases map[string]string
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -82,6 +86,9 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	// Responses API：Codex CLI 唯一支持的 wire protocol（它的 WireApi 枚举
+	// 只剩 Responses 变体）。转换层见 internal/responses。
+	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
@@ -240,20 +247,51 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
-	// 请求体上限：LimitReader 读 limit+1 以探测"超限"（读到 limit+1 字节即已超），
-	// 超限直接 413，不把截断的半截 JSON 喂给上游（issue #41：截断 body 让上游
-	// unmarshal 报 unexpected EOF，网关却罚号轮空）。
-	// 413 是网关侧的客户端问题，不打上游、不罚账号、不轮转。
+	body, peek, ok := h.readChatBody(w, r)
+	if !ok {
+		return
+	}
+	h.executeChat(w, body, peek, chatExecHooks{})
+}
+
+// chatPeek 是请求体的轻量投影：选号需要 model（模型级冷却豁免），
+// 终端分支需要 stream（决定流式透传还是本地聚合）。
+type chatPeek struct {
+	Stream bool   `json:"stream"`
+	Model  string `json:"model"`
+}
+
+// chatExecHooks 替换 executeChat 的终端输出形态。
+//
+// 抽出来的理由：/v1/responses 需要走完全相同的轮转/冷却/提示词链路，
+// 但把「上游 Chat 流」转成「Responses 事件流」再写给客户端。零值即标准
+// OpenAI Chat 行为（透传 SSE / 直接写聚合结果）。
+type chatExecHooks struct {
+	// OnStream 替换默认的 SSE 透传。返回 ttfb、输出 token 数与错误供日志使用。
+	OnStream func(w http.ResponseWriter, rc io.ReadCloser, since time.Time) (time.Duration, int, error)
+	// OnSync 替换默认的 writeJSON。返回输出 token 数与错误供日志使用。
+	OnSync func(w http.ResponseWriter, resp map[string]any) (int, error)
+}
+
+// readChatBody 读取请求体并做上限校验，再投影出 peek。
+//
+// 上限语义：LimitReader 读 limit+1 以探测"超限"（读到 limit+1 字节即已超），
+// 超限直接 413，不把截断的半截 JSON 喂给上游（issue #41：截断 body 让上游
+// unmarshal 报 unexpected EOF，网关却罚号轮空）。
+// 413 是网关侧的客户端问题，不打上游、不罚账号、不轮转。
+//
+// 返回 ok=false 表示已写出错误响应，调用方应直接返回。
+func (h *Handler) readChatBody(w http.ResponseWriter, r *http.Request) ([]byte, chatPeek, bool) {
 	limit := h.cfg.MaxBodyBytes
 	body, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
-		return
+		return nil, chatPeek{}, false
 	}
 	if int64(len(body)) > limit {
 		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_body_too_large",
 			fmt.Sprintf("请求体超过 %d MB 上限：请压缩内容或调大 server.max_body_mb 配置后重试", limit>>20))
-		return
+		return nil, chatPeek{}, false
 	}
 	// 调试开关：设置 WB2A_DUMP_REQ 即把上游侧收到的原始请求体落盘，供离线二分定位指纹命中行。
 	// 仅在排查上游指纹拦截时开启；不设置时零开销、不落盘。
@@ -263,12 +301,49 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			log.Printf("ERR: [server] dump req: %v", err)
 		}
 	}
-	var peek struct {
-		Stream bool   `json:"stream"`
-		Model  string `json:"model"`
-	}
+	var peek chatPeek
 	_ = json.Unmarshal(body, &peek)
+	// 模型别名：客户端 slug → 上游模型名。在此处（读体后、选号前）替换，
+	// 使 peek.Model 也是上游名——选号的模型级冷却豁免（6004 记录的是上游
+	// 模型名）必须用同一套名字才能命中。
+	body = applyModelAlias(body, &peek, h.cfg.ModelAliases)
+	return body, peek, true
+}
 
+// applyModelAlias 把请求体与 peek 里的模型名替换为上游名。
+//
+// 未配置映射或未命中时原样返回（不重排 JSON，避免无谓开销与字段顺序变化）。
+func applyModelAlias(body []byte, peek *chatPeek, aliases map[string]string) []byte {
+	if len(aliases) == 0 || peek.Model == "" {
+		return body
+	}
+	from := peek.Model
+	target, ok := aliases[from]
+	if !ok || target == "" {
+		return body
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(body, &obj) != nil {
+		return body
+	}
+	raw, err := json.Marshal(target)
+	if err != nil {
+		return body
+	}
+	obj["model"] = raw
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	peek.Model = target
+	log.Printf("[server] model alias %s -> %s", from, target)
+	return out
+}
+
+// executeChat 执行一次 chat 请求的完整链路：提示词改写 → 选号 → 轮转 →
+// 错误处置 → 输出。body 必须是标准 Chat Completions 请求体
+// （/v1/responses 的调用方已先把 Responses 请求转成 Chat）。
+func (h *Handler) executeChat(w http.ResponseWriter, body []byte, peek chatPeek, hooks chatExecHooks) {
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
 	defer st.done()
@@ -430,6 +505,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if peek.Stream {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 			st.status = http.StatusOK
+			if hooks.OnStream != nil {
+				// Responses 等协议转换路径：由钩子消费上游流并写出自己的帧格式。
+				// 钩子内部自行统计 TTFB/token（它的输出帧与 Chat 不同，无法复用 chatStatsReader）。
+				ttfb, toks, err := hooks.OnStream(w, rc, st.start)
+				rc.Close()
+				st.ttfb = ttfb
+				if toks >= 0 {
+					st.toks = toks
+				}
+				if err != nil {
+					log.Printf("WARN: [server] stream hook: %v", err)
+				}
+				return
+			}
 			stats := newChatStatsReaderSince(rc, st.start)
 			_ = upstream.Stream(w, stats)
 			st.ttfb = stats.TTFB()
@@ -450,8 +539,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.status = http.StatusBadGateway
 			return
 		}
-		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
+		if hooks.OnSync != nil {
+			toks, err := hooks.OnSync(w, resp)
+			if err != nil {
+				log.Printf("WARN: [server] sync hook: %v", err)
+			}
+			if toks >= 0 {
+				st.toks = toks
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, resp)
 		st.toks = completionTokens(resp)
 		// 成本账本（非流式）：从聚合响应的 usage 取 credit 与 token 总数。
 		if credit, total, ok := usageCreditTotal(resp); ok {
