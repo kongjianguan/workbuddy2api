@@ -416,6 +416,18 @@ func (t *StreamTranslator) openTool(acc *toolAccum) {
 
 // toolItemAdded 构造工具 item 的 added 帧内容。
 func (t *StreamTranslator) toolItemAdded(acc *toolAccum) map[string]any {
+	if acc.name == toolSearchName {
+		// tool_search 用专属的 item 类型（Codex 的 ToolSearchCall）。
+		// arguments 是对象，added 帧里先给空对象占位。
+		return map[string]any{
+			"type":      "tool_search_call",
+			"id":        acc.id,
+			"call_id":   acc.id,
+			"status":    "in_progress",
+			"execution": "client",
+			"arguments": map[string]any{},
+		}
+	}
 	if t.toolCtx.isCustom(acc.name) {
 		return map[string]any{
 			"type":    "custom_tool_call",
@@ -445,6 +457,41 @@ func (t *StreamTranslator) closeTool(acc *toolAccum) {
 	}
 	acc.closed = true
 	rawArgs := acc.args.String()
+
+	if acc.name == toolSearchName {
+		// tool_search：Codex 的 ToolSearchCall.arguments 是**对象**，
+		// 而 Chat 传回的是 JSON 字符串，需解析成对象再放入 item。
+		// 解析失败给空对象：宁可让搜索结果为空，也不要让 Codex 收到非法类型而中断。
+		var argObj any
+		if json.Unmarshal([]byte(rawArgs), &argObj) != nil || argObj == nil {
+			argObj = map[string]any{}
+		}
+		t.emit("response.function_call_arguments.delta", map[string]any{
+			"type":         "response.function_call_arguments.delta",
+			"item_id":      acc.itemID,
+			"output_index": acc.index,
+			"delta":        rawArgs,
+		})
+		t.emit("response.function_call_arguments.done", map[string]any{
+			"type":         "response.function_call_arguments.done",
+			"item_id":      acc.itemID,
+			"output_index": acc.index,
+			"arguments":    rawArgs,
+		})
+		t.emit("response.output_item.done", map[string]any{
+			"type":         "response.output_item.done",
+			"output_index": acc.index,
+			"item": map[string]any{
+				"type":      "tool_search_call",
+				"id":        acc.id,
+				"call_id":   acc.id,
+				"status":    "completed",
+				"execution": "client",
+				"arguments": argObj,
+			},
+		})
+		return
+	}
 
 	if t.toolCtx.isCustom(acc.name) {
 		// custom 工具：解包 {"content":...} 回原文，并把完整内容作为 input。
@@ -577,6 +624,17 @@ func (t *StreamTranslator) finish(status string) {
 	for _, idx := range t.toolOrder {
 		acc := t.tools[idx]
 		if acc == nil || !acc.emitted {
+			continue
+		}
+		if acc.name == toolSearchName {
+			var argObj any
+			if json.Unmarshal([]byte(acc.args.String()), &argObj) != nil || argObj == nil {
+				argObj = map[string]any{}
+			}
+			output = append(output, map[string]any{
+				"type": "tool_search_call", "id": acc.id, "call_id": acc.id,
+				"status": "completed", "execution": "client", "arguments": argObj,
+			})
 			continue
 		}
 		if t.toolCtx.isCustom(acc.name) {

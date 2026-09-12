@@ -43,12 +43,18 @@ type OutputItem struct {
 	Content2         []ContentPart `json:"-"` // 占位避免混淆；reasoning 的内容走 Summary
 	EncryptedContent *string       `json:"encrypted_content,omitempty"`
 
-	// function_call / custom_tool_call 专用
-	Name      string `json:"name,omitempty"`
-	Arguments string `json:"arguments,omitempty"` // function_call：JSON 字符串
-	Input     string `json:"input,omitempty"`     // custom_tool_call：原始文本
+	// function_call / custom_tool_call / tool_search_call 专用
+	Name string `json:"name,omitempty"`
+	// Arguments 承载两种形态：function_call 是 JSON **字符串**（Chat 规范），
+	// tool_search_call 是 **对象**（Codex 的 ToolSearchCall.arguments 是 Value）。
+	// 用 any 而非 string 以免为后者额外开字段。
+	Arguments any    `json:"arguments,omitempty"`
+	Input     string `json:"input,omitempty"` // custom_tool_call：原始文本
 	CallID    string `json:"call_id,omitempty"`
 	Namespace string `json:"namespace,omitempty"`
+
+	// tool_search_call 专用：Codex 靠 execution 字段识别并执行客户端搜索。
+	Execution string `json:"execution,omitempty"`
 }
 
 // ContentPart 是 message 的内容块。
@@ -197,6 +203,27 @@ func messageToOutputItems(msg map[string]any, toolCtx *ToolContext) []OutputItem
 		name := strOf(fn["name"])
 		args := strOf(fn["arguments"])
 		callID := firstNonEmpty(strOf(tc["id"]), newID("call_"))
+
+		// tool_search 还原：Codex 期望 type:"tool_search_call"，且 arguments 是
+		// **对象**而非字符串（见 codex-rs/protocol/src/models.rs 的 ToolSearchCall
+		// 与 sse/responses.rs 的 parses_tool_search_call_items 测试）。
+		// 它靠 call_id + execution 关联后续回传的 tool_search_output，
+		// 形态错了这条链就断了。
+		if name == toolSearchName {
+			var argObj any
+			if json.Unmarshal([]byte(args), &argObj) != nil {
+				argObj = map[string]any{}
+			}
+			items = append(items, OutputItem{
+				Type:      "tool_search_call",
+				ID:        callID,
+				Status:    "completed",
+				CallID:    callID,
+				Execution: "client",
+				Arguments: argObj,
+			})
+			continue
+		}
 
 		// custom 工具还原：桥接时把原文包成 {"content":...}，
 		// 现在解包回 custom_tool_call.input。这一步是 apply_patch 能用的关键——

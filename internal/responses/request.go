@@ -65,15 +65,18 @@ func NewToolContext(tools []Tool) (*ToolContext, []map[string]any) {
 				ctx.chatTools = append(ctx.chatTools, functionToolToChatTool(chatName, nested))
 			}
 		case ToolSearch:
-			// tool_search 不在 Chat Completions 规范内。这里的策略是原样透传，
-			// 与 LiteLLM 的行为一致（实测上游接受并返回 200）。
-			// 未验证的是：上游究竟据此改变了工具发现行为，还是静默忽略。
-			// 无论哪种，降级都是良性的——模型看不到搜索结果就继续用现有工具。
-			// 保留 Raw 是为了不丢失 description 里的降级工具元数据。
-			var raw map[string]any
-			if json.Unmarshal(t.Raw, &raw) == nil && raw != nil {
-				ctx.chatTools = append(ctx.chatTools, raw)
-			}
+			// tool_search 是 Codex 的客户端工具发现机制（execution:"client"）。
+			//
+			// 原先原样透传 type:"tool_search"，但实测上游**静默忽略**它——
+			// 模型根本看不到这个工具（直接问 Codex 时它回答"我没有 tool_search 工具"）。
+			// 原因是它不在 Chat Completions 的工具类型白名单里，上游收下但不呈现给模型。
+			//
+			// 改为转成名为 tool_search 的普通 function（与 cc-switch 同做法）：
+			// 模型能看见并调用它；Codex 客户端收到调用后自行执行搜索，
+			// 再把结果作为 tool_search_output 回传（其中带新发现的工具，
+			// 由 collectToolSearchOutputTools 收集后加入后续请求）。
+			ctx.chatNameToSpec[toolSearchName] = ToolSpec{Kind: ToolSearch, Name: toolSearchName}
+			ctx.chatTools = append(ctx.chatTools, toolSearchToChatTool(t))
 		default:
 			ctx.chatNameToSpec[t.Name] = ToolSpec{Kind: ToolFunction, Name: t.Name}
 			ctx.chatTools = append(ctx.chatTools, functionToolToChatTool(t.Name, t))
@@ -291,6 +294,18 @@ func BuildChatRequest(req *Request) (*ChatRequest, *ToolContext, error) {
 		})
 	}
 
+	// tool_search 发现的新工具：从 input 里的 tool_search_output item 提取并加入
+	// tools。必须在 buildMessages 之前做——那些工具也要参与本轮的 messages 转换
+	// （例如它们的 function_call 历史需要按正确类型还原）。
+	// 必须在这里而非 NewToolContext 里做：搜索结果是 input 的一部分，而
+	// NewToolContext 只看顶层 tools 字段。
+	if raw := rawInputValue(req.Input); raw != nil {
+		collectToolSearchOutputTools(raw, toolCtx)
+		if len(toolCtx.chatTools) > len(out.Tools) {
+			out.Tools = toolCtx.chatTools
+		}
+	}
+
 	msgs, err := buildMessages(req.Input, toolCtx)
 	if err != nil {
 		return nil, nil, err
@@ -405,6 +420,34 @@ func buildMessages(input json.RawMessage, toolCtx *ToolContext) ([]ChatMessage, 
 				pendingToolCalls = append(pendingToolCalls, fc)
 			}
 
+		case "tool_search_call":
+			// tool_search 调用作为历史 item 时也要转成 Chat 的 tool_call，
+			// 与它对应的 tool_search_output（下面转成 tool 消息）配对。
+			// 漏掉这个分支会让搜索结果变成孤儿 tool 消息，上游会因
+			// 「tool 消息没有前置 tool_calls」而拒绝整个请求。
+			var s struct {
+				CallID    string          `json:"call_id"`
+				ID        string          `json:"id"`
+				Arguments json.RawMessage `json:"arguments"`
+			}
+			if json.Unmarshal(raw, &s) != nil {
+				continue
+			}
+			args := "{}"
+			if len(s.Arguments) > 0 {
+				// arguments 是对象（Codex 的 ToolSearchCall.arguments 是 Value），
+				// Chat 要求字符串，直接沿用原始 JSON 文本。
+				args = string(s.Arguments)
+			}
+			pendingToolCalls = append(pendingToolCalls, map[string]any{
+				"id":   firstNonEmpty(s.CallID, s.ID),
+				"type": "function",
+				"function": map[string]any{
+					"name":      toolSearchName,
+					"arguments": args,
+				},
+			})
+
 		case "custom_tool_call":
 			// custom 工具调用（Codex 的 apply_patch）：input 是原文，要包成
 			// {"content": ...} 才能作为 Chat arguments 发出。
@@ -457,10 +500,32 @@ func buildMessages(input json.RawMessage, toolCtx *ToolContext) ([]ChatMessage, 
 			pendingReasoning += reasoningText(raw)
 
 		case "tool_search_output":
-			// 工具搜索结果里可能带新工具定义。Codex 期望这些工具在后续请求的
-			// tools 里出现。当前实现：忽略（模型仍可用已有工具，属良性降级）。
-			// TODO(P5): 收集并加入 tools，见 cc-switch 的 collect_tool_search_output_tools
-			continue
+			// 工具搜索结果要作为 tool 消息回给上游，模型才知道搜到了什么。
+			// 工具定义本身由 collectToolSearchOutputTools 单独收集（它需要遍历
+			// 整个 input，因为 output 可能嵌在非数组结构里），这里只负责把结果
+			// 内容喂给模型。
+			flushPending()
+			var o struct {
+				CallID string          `json:"call_id"`
+				Tools  json.RawMessage `json:"tools"`
+			}
+			if json.Unmarshal(raw, &o) != nil {
+				continue
+			}
+			// 结果体 = tools 数组的 JSON。压缩成单行：原样带缩进会浪费 token，
+			// 而搜索结果可能很长。格式非法时保守给 {}，不让整个请求失败。
+			content := "{}"
+			var decoded any
+			if json.Unmarshal(o.Tools, &decoded) == nil {
+				if b, err := json.Marshal(decoded); err == nil && len(b) > 0 {
+					content = string(b)
+				}
+			}
+			msgs = append(msgs, ChatMessage{
+				Role:       "tool",
+				ToolCallID: o.CallID,
+				Content:    content,
+			})
 		}
 	}
 	flushPending()
@@ -621,4 +686,130 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// toolSearchName 是 tool_search 转成 Chat function 后使用的名字。
+//
+// 保持与 Responses 侧同名（而非另起名字）：Codex 客户端按名字识别这个调用，
+// 回传的 tool_search_output 也按此关联。改名会割断这条链。
+const toolSearchName = "tool_search"
+
+// toolSearchToChatTool 把 Responses 的 tool_search 转成 Chat function。
+//
+// type:"tool_search" 不是 Chat 的合法工具类型，上游会静默忽略（实测：模型看不到它）。
+// 转成 function 后模型才能调用，进而触发 Codex 的客户端搜索。
+//
+// description 保留原始内容：它内含可用工具源清单（Context7 / agent-lsp 等）
+// 与 BM25 搜索语义，是模型判断"该不该搜、搜什么"的依据。丢了它模型不会用这个工具。
+func toolSearchToChatTool(t Tool) map[string]any {
+	desc := strings.TrimSpace(t.Description)
+	if desc == "" {
+		desc = "Search and load available tools for the current task."
+	}
+	// 参数用 Responses 侧声明的原样（query 必填、limit 可选）；
+	// 缺失时给最小可用形态，避免模型拿到无参数的工具而不知如何调用。
+	params := any(t.Parameters)
+	if len(t.Parameters) == 0 {
+		params = map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"query": map[string]any{"type": "string", "description": "Search query for deferred tools."},
+			},
+			"required": []string{"query"},
+		}
+	} else {
+		var v any
+		if json.Unmarshal(t.Parameters, &v) == nil {
+			params = v
+		} else {
+			params = map[string]any{"type": "object", "properties": map[string]any{}}
+		}
+	}
+	return map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":        toolSearchName,
+			"description": desc,
+			"parameters":  params,
+		},
+	}
+}
+
+// collectToolSearchOutputTools 从 input 里提取 tool_search 发现的新工具。
+//
+// 工作方式：Codex 执行搜索后，把结果作为 tool_search_output item 放进下一轮
+// input，其 tools 数组是完整的 Responses 工具定义。这些工具必须出现在本轮
+// 发给上游的 tools 里，模型才能调用它们——否则搜索结果等于没给。
+//
+// 递归遍历（而非只看 input 顶层）：output 可能嵌在任意深度的结构里。
+func collectToolSearchOutputTools(v any, ctx *ToolContext) {
+	switch t := v.(type) {
+	case []any:
+		for _, e := range t {
+			collectToolSearchOutputTools(e, ctx)
+		}
+	case map[string]any:
+		if strOf(t["type"]) == "tool_search_output" {
+			if arr, ok := t["tools"].([]any); ok {
+				for _, raw := range arr {
+					ctx.addDiscoveredTool(raw)
+				}
+			}
+		}
+		for _, e := range t {
+			collectToolSearchOutputTools(e, ctx)
+		}
+	}
+}
+
+// addDiscoveredTool 把 tool_search 发现的工具加入工具集。
+//
+// 已存在同名工具时跳过：Codex 每轮重发全量 tools，搜索发现的工具可能已在
+// 顶层声明过，重复加入会让上游看到重复定义。
+func (c *ToolContext) addDiscoveredTool(raw any) {
+	if c == nil {
+		return
+	}
+	b, err := json.Marshal(raw)
+	if err != nil {
+		return
+	}
+	var t Tool
+	if json.Unmarshal(b, &t) != nil || t.Name == "" {
+		return
+	}
+	if _, exists := c.chatNameToSpec[t.Name]; exists {
+		return
+	}
+	switch t.Kind {
+	case ToolCustom:
+		c.customNames[t.Name] = true
+		c.chatNameToSpec[t.Name] = ToolSpec{Kind: ToolCustom, Name: t.Name}
+		c.chatTools = append(c.chatTools, customToolToChatTool(t))
+	case ToolNamespace:
+		for _, nested := range t.Tools {
+			chatName := flattenNamespaceName(t.Name, nested.Name)
+			if _, exists := c.chatNameToSpec[chatName]; exists {
+				continue
+			}
+			c.chatNameToSpec[chatName] = ToolSpec{Kind: ToolNamespace, Name: nested.Name, Namespace: t.Name}
+			c.chatTools = append(c.chatTools, functionToolToChatTool(chatName, nested))
+		}
+	default:
+		c.chatNameToSpec[t.Name] = ToolSpec{Kind: ToolFunction, Name: t.Name}
+		c.chatTools = append(c.chatTools, functionToolToChatTool(t.Name, t))
+	}
+}
+
+// rawInputValue 把 input 解析成通用 any（数组或字符串）。
+// 供 tool_search 结果收集使用——它需要递归遍历结构，而非按类型分派。
+func rawInputValue(raw json.RawMessage) any {
+	if len(raw) == 0 {
+		return nil
+	}
+	var v any
+	if json.Unmarshal(raw, &v) != nil {
+		return nil
+	}
+	return v
 }

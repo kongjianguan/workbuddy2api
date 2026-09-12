@@ -241,3 +241,139 @@ func mustJSON(t *testing.T, v any) string {
 	}
 	return string(b)
 }
+
+// tool_search 必须转成普通 function。
+//
+// 背景：type:"tool_search" 不在 Chat Completions 白名单里，原样透传时上游
+// **静默忽略**它——实测直接问 Codex，它回答"我没有 tool_search 这个工具"。
+// 转成 function 后模型才能看见并调用，进而触发 Codex 的客户端搜索。
+func TestToolSearchConvertedToFunction(t *testing.T) {
+	req := &Request{
+		Model: "m",
+		Input: json.RawMessage(`"find tools"`),
+		Tools: []Tool{{
+			Kind:        ToolSearch,
+			Execution:   "client",
+			Description: "# Tool discovery\nSearches deferred tools.",
+			Raw:         json.RawMessage(`{"type":"tool_search","execution":"client","description":"# Tool discovery\nSearches deferred tools.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}`),
+		}},
+	}
+	out, ctx, err := BuildChatRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Tools) != 1 {
+		t.Fatalf("tools 数 = %d, want 1", len(out.Tools))
+	}
+	tool := out.Tools[0]
+	if tool["type"] != "function" {
+		t.Errorf("type = %v, want function（原样透传会被上游忽略）", tool["type"])
+	}
+	fn, _ := tool["function"].(map[string]any)
+	if fn["name"] != "tool_search" {
+		t.Errorf("name = %v, want tool_search", fn["name"])
+	}
+	// description 必须保留：内含可用工具源清单，丢了模型不会用这个工具
+	if !strings.Contains(fn["description"].(string), "Tool discovery") {
+		t.Errorf("description 丢失: %v", fn["description"])
+	}
+	if _, ok := ctx.chatNameToSpec["tool_search"]; !ok {
+		t.Error("未登记 tool_search，回程无法还原成 tool_search_call")
+	}
+}
+
+// tool_search_output 里的新工具必须被收集进 tools。
+//
+// 否则搜索结果等于白给：模型看到工具描述却无法调用（不在 tools 列表里）。
+func TestCollectToolSearchOutputTools(t *testing.T) {
+	req := &Request{
+		Model: "m",
+		Input: json.RawMessage(`[
+			{"type":"tool_search_call","call_id":"s1","execution":"client","arguments":{"query":"docs"}},
+			{"type":"tool_search_output","call_id":"s1","status":"completed","execution":"client",
+			 "tools":[{"type":"function","name":"context7_docs","description":"Fetch docs",
+			   "parameters":{"type":"object","properties":{"q":{"type":"string"}}}}]}
+		]`),
+	}
+	out, ctx, err := BuildChatRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 发现的工具应出现在 tools 里
+	var found bool
+	for _, tool := range out.Tools {
+		if fn, ok := tool["function"].(map[string]any); ok && fn["name"] == "context7_docs" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("tool_search 发现的工具未被加入 tools；模型无法调用它。tools=%v", out.Tools)
+	}
+	if _, ok := ctx.chatNameToSpec["context7_docs"]; !ok {
+		t.Error("发现的工具未登记到上下文")
+	}
+}
+
+// tool_search_output 要作为 tool 消息回给上游，模型才知道搜到了什么
+func TestToolSearchOutputBecomesToolMessage(t *testing.T) {
+	req := &Request{
+		Model: "m",
+		Input: json.RawMessage(`[
+			{"type":"tool_search_call","call_id":"s1","execution":"client","arguments":{"query":"x"}},
+			{"type":"tool_search_output","call_id":"s1","status":"completed","execution":"client",
+			 "tools":[{"type":"function","name":"t1","description":"d1"}]}
+		]`),
+	}
+	out, _, err := BuildChatRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var toolMsg *ChatMessage
+	for i := range out.Messages {
+		if out.Messages[i].Role == "tool" {
+			toolMsg = &out.Messages[i]
+		}
+	}
+	if toolMsg == nil {
+		t.Fatalf("未产出 tool 消息，模型看不到搜索结果: %+v", out.Messages)
+	}
+	if toolMsg.ToolCallID != "s1" {
+		t.Errorf("tool_call_id = %s, want s1（关联搜索调用）", toolMsg.ToolCallID)
+	}
+	content, _ := toolMsg.Content.(string)
+	if !strings.Contains(content, "t1") {
+		t.Errorf("搜索结果内容里没有工具名: %q", content)
+	}
+}
+
+// tool_search_call 作为历史 item 时，要转成 Chat 的 tool_call（不是 custom/function）
+func TestToolSearchCallItemConverted(t *testing.T) {
+	req := &Request{
+		Model: "m",
+		Input: json.RawMessage(`[
+			{"type":"tool_search_call","call_id":"s1","execution":"client","arguments":{"query":"docs","limit":3}},
+			{"type":"tool_search_output","call_id":"s1","status":"completed","execution":"client","tools":[]}
+		]`),
+	}
+	out, _, err := BuildChatRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, m := range out.Messages {
+		for _, tc := range m.ToolCalls {
+			fn, _ := tc["function"].(map[string]any)
+			if fn["name"] == "tool_search" {
+				found = true
+				// arguments 必须是 JSON 字符串（Chat 规范）
+				args, _ := fn["arguments"].(string)
+				if !strings.Contains(args, "docs") {
+					t.Errorf("arguments 丢失查询内容: %q", args)
+				}
+			}
+		}
+	}
+	if !found {
+		t.Errorf("tool_search_call 未转成 Chat tool_call: %+v", out.Messages)
+	}
+}
