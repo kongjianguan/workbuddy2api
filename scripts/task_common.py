@@ -12,7 +12,13 @@
 """
 import json, os, time, glob, urllib.request, urllib.error
 
-AUTHS = "/root/workbuddy2api/auths"
+# auths 目录：环境变量 WB2A_AUTH_DIR（与网关同款变量名）优先，未设则按脚本位置推导——
+# 仓库内 = <repo>/auths，镜像内 = /app/auths。相对值锚定脚本所在仓库根，而非 cwd。
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+AUTHS = os.environ.get("WB2A_AUTH_DIR") or "auths"
+if not os.path.isabs(AUTHS):
+    AUTHS = os.path.join(_REPO_ROOT, AUTHS)
+
 CHAT_BASE = "https://copilot.tencent.com"   # growth / tasks / buddy / streak / chat
 BILL_BASE = "https://www.codebuddy.cn"      # report / billing
 
