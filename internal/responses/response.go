@@ -229,14 +229,20 @@ func messageToOutputItems(msg map[string]any, toolCtx *ToolContext) []OutputItem
 		// 现在解包回 custom_tool_call.input。这一步是 apply_patch 能用的关键——
 		// 不解包的话 Codex 会拿到 JSON 字符串而非 patch 文本，patch 必然失败。
 		if toolCtx != nil && toolCtx.isCustom(name) {
-			items = append(items, OutputItem{
+			item := OutputItem{
 				Type:   "custom_tool_call",
 				ID:     callID,
 				Status: "completed",
 				CallID: callID,
 				Name:   name,
 				Input:  unwrapCustomArguments(args),
-			})
+			}
+			// namespace 里嵌套的 custom：拆回原始名并带上 namespace 供 Codex 派发
+			if spec, ok := toolCtx.lookup(name); ok && spec.Namespace != "" {
+				item.Name = spec.Name
+				item.Namespace = spec.Namespace
+			}
+			items = append(items, item)
 			continue
 		}
 
@@ -250,7 +256,7 @@ func messageToOutputItems(msg map[string]any, toolCtx *ToolContext) []OutputItem
 			Arguments: args,
 		}
 		if toolCtx != nil {
-			if spec, ok := toolCtx.lookup(name); ok && spec.Kind == ToolNamespace {
+			if spec, ok := toolCtx.lookup(name); ok && spec.Namespace != "" {
 				item.Name = spec.Name
 				item.Namespace = spec.Namespace
 			}

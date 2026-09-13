@@ -497,6 +497,11 @@ func (t *StreamTranslator) closeTool(acc *toolAccum) {
 		// custom 工具：解包 {"content":...} 回原文，并把完整内容作为 input。
 		// Codex 的 apply_patch 靠这个字段拿到 patch 文本。
 		input := unwrapCustomArguments(rawArgs)
+		// namespace 里嵌套的 custom：拆回原始名并带上 namespace 供 Codex 派发。
+		name, namespace := acc.name, ""
+		if spec, ok := t.toolCtx.lookup(acc.name); ok && spec.Namespace != "" {
+			name, namespace = spec.Name, spec.Namespace
+		}
 		t.emit("response.custom_tool_call_input.delta", map[string]any{
 			"type":         "response.custom_tool_call_input.delta",
 			"item_id":      acc.itemID,
@@ -509,17 +514,21 @@ func (t *StreamTranslator) closeTool(acc *toolAccum) {
 			"output_index": acc.index,
 			"input":        input,
 		})
+		item := map[string]any{
+			"type":    "custom_tool_call",
+			"id":      acc.id,
+			"call_id": acc.id,
+			"name":    name,
+			"status":  "completed",
+			"input":   input,
+		}
+		if namespace != "" {
+			item["namespace"] = namespace
+		}
 		t.emit("response.output_item.done", map[string]any{
 			"type":         "response.output_item.done",
 			"output_index": acc.index,
-			"item": map[string]any{
-				"type":    "custom_tool_call",
-				"id":      acc.id,
-				"call_id": acc.id,
-				"name":    acc.name,
-				"status":  "completed",
-				"input":   input,
-			},
+			"item":         item,
 		})
 		return
 	}
@@ -542,9 +551,11 @@ func (t *StreamTranslator) closeTool(acc *toolAccum) {
 		"arguments":    rawArgs,
 	})
 
-	// namespace 还原：拆回 name + namespace 供 Codex 派发
+	// namespace 还原：拆回 name + namespace 供 Codex 派发。
+	// 按 Namespace 字段判定而非 Kind==ToolNamespace：namespace 里嵌套的 custom
+	// 注册为 ToolCustom，但同样要拆名。
 	name, namespace := acc.name, ""
-	if spec, ok := t.toolCtx.lookup(acc.name); ok && spec.Kind == ToolNamespace {
+	if spec, ok := t.toolCtx.lookup(acc.name); ok && spec.Namespace != "" {
 		name, namespace = spec.Name, spec.Namespace
 	}
 	item := map[string]any{
@@ -638,15 +649,19 @@ func (t *StreamTranslator) finish(status string) {
 			continue
 		}
 		if t.toolCtx.isCustom(acc.name) {
-			output = append(output, map[string]any{
+			it := map[string]any{
 				"type": "custom_tool_call", "id": acc.id, "call_id": acc.id,
 				"name": acc.name, "status": "completed",
 				"input": unwrapCustomArguments(acc.args.String()),
-			})
+			}
+			if spec, ok := t.toolCtx.lookup(acc.name); ok && spec.Namespace != "" {
+				it["name"], it["namespace"] = spec.Name, spec.Namespace
+			}
+			output = append(output, it)
 			continue
 		}
 		name, ns := acc.name, ""
-		if spec, ok := t.toolCtx.lookup(acc.name); ok && spec.Kind == ToolNamespace {
+		if spec, ok := t.toolCtx.lookup(acc.name); ok && spec.Namespace != "" {
 			name, ns = spec.Name, spec.Namespace
 		}
 		it := map[string]any{

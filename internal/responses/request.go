@@ -55,10 +55,23 @@ func NewToolContext(tools []Tool) (*ToolContext, []map[string]any) {
 		case ToolCustom:
 			ctx.customNames[t.Name] = true
 			ctx.chatNameToSpec[t.Name] = ToolSpec{Kind: ToolCustom, Name: t.Name}
-			ctx.chatTools = append(ctx.chatTools, customToolToChatTool(t))
+			ctx.chatTools = append(ctx.chatTools, customToolToChatTool(t, t.Name))
 		case ToolNamespace:
 			for _, nested := range t.Tools {
 				chatName := flattenNamespaceName(t.Name, nested.Name)
+				if nested.Kind == ToolCustom {
+					// namespace 里嵌套的 custom（freeform）工具与顶层 custom 走
+					// 同一套包装：content 参数 + 文法进 description。否则模型看到
+					// 空参数 schema，只能传 {}——2026-09-13 线上：Codex 0.154 的
+					// functions.exec 被空参调用，工具返回 aborted，模型无限重试。
+					// Responses 侧身份仍记 namespace，回程按它还原工具名。
+					ctx.customNames[chatName] = true
+					ctx.chatNameToSpec[chatName] = ToolSpec{
+						Kind: ToolCustom, Name: nested.Name, Namespace: t.Name,
+					}
+					ctx.chatTools = append(ctx.chatTools, customToolToChatTool(nested, chatName))
+					continue
+				}
 				ctx.chatNameToSpec[chatName] = ToolSpec{
 					Kind: ToolNamespace, Name: nested.Name, Namespace: t.Name,
 				}
@@ -113,7 +126,10 @@ func functionToolToChatTool(name string, t Tool) map[string]any {
 //
 // 原工具的 format 定义（Codex 传 lark 文法）不能丢——放进 description 让模型
 // 知道该按什么语法产出内容。
-func customToolToChatTool(t Tool) map[string]any {
+//
+// chatName 是发给上游的 function 名：顶层 custom 就是原名；namespace 里嵌套的
+// custom 是扁平化名（见 flattenNamespaceName）。
+func customToolToChatTool(t Tool, chatName string) map[string]any {
 	desc := t.Description
 	// 把 format 里的文法定义附加到 description。Codex 的 apply_patch 依赖这段
 	// 文法才能产出正确的 patch；丢了它模型会凭猜测写，patch 大概率格式错误。
@@ -134,7 +150,7 @@ func customToolToChatTool(t Tool) map[string]any {
 	return map[string]any{
 		"type": "function",
 		"function": map[string]any{
-			"name":        t.Name,
+			"name":        chatName,
 			"description": desc,
 			"parameters": map[string]any{
 				"type": "object",
@@ -791,11 +807,21 @@ func (c *ToolContext) addDiscoveredTool(raw any) {
 	case ToolCustom:
 		c.customNames[t.Name] = true
 		c.chatNameToSpec[t.Name] = ToolSpec{Kind: ToolCustom, Name: t.Name}
-		c.chatTools = append(c.chatTools, customToolToChatTool(t))
+		c.chatTools = append(c.chatTools, customToolToChatTool(t, t.Name))
 	case ToolNamespace:
 		for _, nested := range t.Tools {
 			chatName := flattenNamespaceName(t.Name, nested.Name)
 			if _, exists := c.chatNameToSpec[chatName]; exists {
+				continue
+			}
+			if nested.Kind == ToolCustom {
+				// 与 NewToolContext 同理：嵌套 custom 也要 content 参数包装，
+				// 见 ToolNamespace 分支里的注释。
+				c.customNames[chatName] = true
+				c.chatNameToSpec[chatName] = ToolSpec{
+					Kind: ToolCustom, Name: nested.Name, Namespace: t.Name,
+				}
+				c.chatTools = append(c.chatTools, customToolToChatTool(nested, chatName))
 				continue
 			}
 			c.chatNameToSpec[chatName] = ToolSpec{Kind: ToolNamespace, Name: nested.Name, Namespace: t.Name}

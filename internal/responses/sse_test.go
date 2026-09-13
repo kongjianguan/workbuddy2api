@@ -231,6 +231,48 @@ func TestStreamTranslator_CustomToolUnwrapped(t *testing.T) {
 	}
 }
 
+// namespace 里嵌套的 custom 工具：custom_tool_call 要拆回原始名 + namespace，
+// 且 input 解包 {"content":...} 回原文（2026-09-13：Codex 0.154 的 functions.exec）
+func TestStreamTranslator_NamespaceCustomToolUnwrapped(t *testing.T) {
+	js := "return await tools.shell({cmd: \"ls\"})"
+	wrapped, _ := json.Marshal(map[string]string{"content": js})
+	sse := chatSSE(
+		`{"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"functions__exec","arguments":` + mustJSONStr(string(wrapped)) + `}}]}}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+	)
+	ctx := &ToolContext{
+		customNames: map[string]bool{"functions__exec": true},
+		chatNameToSpec: map[string]ToolSpec{
+			"functions__exec": {Kind: ToolCustom, Name: "exec", Namespace: "functions"},
+		},
+	}
+	_, datas, _ := runTranslator(t, sse, ctx)
+
+	var saw bool
+	for _, d := range datas {
+		if d["type"] != "response.output_item.done" {
+			continue
+		}
+		item, _ := d["item"].(map[string]any)
+		if item == nil || item["type"] != "custom_tool_call" {
+			continue
+		}
+		saw = true
+		if item["name"] != "exec" {
+			t.Errorf("工具名应拆回原始名 exec，得到 %v", item["name"])
+		}
+		if item["namespace"] != "functions" {
+			t.Errorf("namespace 应为 functions，得到 %v", item["namespace"])
+		}
+		if got := item["input"]; got != js {
+			t.Errorf("input 未解包:\n got  %q\n want %q", got, js)
+		}
+	}
+	if !saw {
+		t.Error("未找到 custom_tool_call 的 output_item.done")
+	}
+}
+
 // namespace 工具：扁平名要还原成 name + namespace
 func TestStreamTranslator_NamespaceRestored(t *testing.T) {
 	sse := chatSSE(

@@ -114,7 +114,7 @@ func TestCustomToolToChatTool_GrammarInDescription(t *testing.T) {
 		Description: "Edit files.",
 		Format:      json.RawMessage(`{"type":"grammar","syntax":"lark","definition":"start: patch"}`),
 	}
-	out := customToolToChatTool(tool)
+	out := customToolToChatTool(tool, tool.Name)
 	fn := out["function"].(map[string]any)
 
 	desc := fn["description"].(string)
@@ -412,6 +412,31 @@ func TestBuildChatRequest_AdditionalToolsItem(t *testing.T) {
 	for _, want := range []string{"functions__exec", "get_weather"} {
 		if !names[want] {
 			t.Errorf("工具 %q 未出现在转换结果: %v", want, names)
+		}
+	}
+	// 嵌套 custom 必须带 content 参数（否则模型只能传 {}，工具必然失败）
+	for _, tl := range out.Tools {
+		fn, _ := tl["function"].(map[string]any)
+		if fn["name"] != "functions__exec" {
+			continue
+		}
+		params, _ := fn["parameters"].(map[string]any)
+		props, _ := params["properties"].(map[string]any)
+		if _, ok := props["content"]; !ok {
+			t.Errorf("嵌套 custom 工具缺 content 参数，模型将无法传入输入: %v", fn)
+		}
+		// required 在内存里是 []string，经 JSON 往返后是 []any，两种都要认
+		switch r := params["required"].(type) {
+		case []string:
+			if len(r) == 0 {
+				t.Errorf("content 应为必填参数: %v", params)
+			}
+		case []any:
+			if len(r) == 0 {
+				t.Errorf("content 应为必填参数: %v", params)
+			}
+		default:
+			t.Errorf("content 应为必填参数: %v", params)
 		}
 	}
 	// assistant 消息不受影响
