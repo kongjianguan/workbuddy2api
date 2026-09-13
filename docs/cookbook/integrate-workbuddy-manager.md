@@ -141,6 +141,20 @@ services:
 取 Release 包替换 `server/` 与 `web/out/`、同步 `.version`，再
 `systemctl --user restart workbuddy-web`（`CHANGELOG.md` 一并复制，否则「更新日志」页报错）。
 
+被墙的机器上若要让网关仓库自己能拉取，不必每次搬包：`github.com:443` 不通时
+`ssh.github.com:443` 往往仍可达，在部署机上生成一对密钥、把公钥登记为仓库的
+**只读部署密钥**，并给 `~/.ssh/config` 加一个 `HostName ssh.github.com` / `Port 443`
+的别名，`git fetch origin` 即可照常用。此后上游更新就是标准三步：
+
+```sh
+cd <部署目录> && git fetch origin && git reset --hard origin/master
+docker compose up -d --build
+systemctl --user restart workbuddy-web   # 仅更新了管理端时才需要
+```
+
+`auths/`、`data/`、`config.json` 都在 `.gitignore` 中，`git reset --hard` 不会动它们；
+未跟踪的 `docker-compose.override.yml`（见上）也保留。注意别用 `git clean -fdx`。
+
 ### 按需启动（不常驻）
 
 管理端对网关是单向依赖，停掉它**不影响网关**：账号轮询、并发、熔断、以及四类定时任务
