@@ -454,6 +454,13 @@ experimental_bearer_token = "<api_key>"
 - Session 失效账号被禁用（`disabled_reason` 透出在 `/status`）后，可用 `./login.sh` 重新登录覆盖凭证；已持久化 `disabled=true` 的账号可在源码侧调用 `Pool.ReviveDisabled(uid)` 复活（`state.json` 中清除 `disabled` 标志）
 - 备份 = `auths/`（凭证）+ `data/state.json`（池状态：积分 / 冷却 / 计数）；配置 Upstash 后状态另镜像至 Redis（7 天 TTL）
 
+### 配套 Web 控制台
+
+第三方控制台 [ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager)
+可直接把本网关当作上游纳管：扫码加号、自动签到、密钥分发、IP 管控、调用日志与用量统计，
+本网关不需要为它改动代码。接入步骤、两者之间的契约与管理端默认指向另一仓库的注意事项见
+[接入 workbuddy-manager 控制台](docs/cookbook/integrate-workbuddy-manager.md)。
+
 ## 安全与合规
 
 ### 1. 凭据管理（auths）
