@@ -59,6 +59,8 @@ token 刷新 → 上游调用 → 错误分类与账号处置 → 轮转 → 输
 `internal/responses` 把 Responses 请求转成 Chat 请求、把 Chat 响应转回 Responses。
 三类非标准工具的转换规则与 Codex 侧的事件消费面见
 [子系统：Responses 协议转换](subsystems/responses-protocol.md)。
+同一包也可由独立进程 `cmd/responses-proxy` 挂在任意 Chat Completions 网关前面，
+步骤见 [独立运行 Responses 转换代理](cookbook/run-responses-proxy.md)。
 
 ## 扩展点
 

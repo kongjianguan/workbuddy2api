@@ -332,6 +332,9 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 > 鉴权规则：仅当 `api_key` 非空才校验 `Authorization: Bearer <api_key>`；**`api_key` 为空时上述端点直接放行**；`/healthz` 恒无鉴权。
 
+原作者网关没有此端点时，用独立进程 `cmd/responses-proxy` 挂在前面：
+见 [独立运行 Responses 转换代理](docs/cookbook/run-responses-proxy.md)。
+
 ### Responses API（Codex 直连）
 
 Codex CLI 的唯一 wire protocol 已是 Responses（其 `WireApi` 枚举移除了 chat 变体），
