@@ -15,9 +15,11 @@ Status: implemented
 
 ## Decision
 
-出站 `http.Transport` 强制 HTTP/1.1（`ForceAttemptHTTP2: false`），空闲连接超时从
-90s 收到 30s，并补 `TLSHandshakeTimeout=10s`。聊天传输层失败时调用
-`CloseIdleConnections()`，避免下一次请求再捡到刚失败的连接。
+出站 `http.Transport` 用空的 `TLSNextProto` 真正关掉 HTTP/2（`ForceAttemptHTTP2=false`
+只在自定义 Dial 时生效，默认 TLS 仍会 ALPN 出 h2——线上已验证关掉该开关后日志仍报
+`http2: timeout awaiting response headers`）。空闲连接超时从 90s 收到 30s，并补
+`TLSHandshakeTimeout=10s`。聊天传输层失败时调用 `CloseIdleConnections()`，避免
+下一次请求再捡到刚失败的连接。
 
 HTTP/1.1 每请求一条连接（keep-alive 仍复用，但没有 h2 多路复用流），半死连接
 不会拖累后续请求。这是针对当前故障形态的最小修复，不引入连接健康探测。

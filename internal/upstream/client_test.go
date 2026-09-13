@@ -466,8 +466,11 @@ func TestNewChatClientNoTotalTimeoutAndSharedTransport(t *testing.T) {
 		if htr.ResponseHeaderTimeout != 120*time.Second {
 			t.Errorf("ResponseHeaderTimeout=%v want 120s", htr.ResponseHeaderTimeout)
 		}
-		if htr.ForceAttemptHTTP2 {
-			t.Error("ForceAttemptHTTP2 should be false: HTTP/2 idle streams stall as header timeout")
+		if htr.TLSNextProto == nil {
+			t.Error("TLSNextProto must be non-nil empty map to disable HTTP/2")
+		}
+		if _, ok := htr.TLSNextProto["h2"]; ok {
+			t.Error("TLSNextProto must not register h2")
 		}
 		if htr.IdleConnTimeout != 30*time.Second {
 			t.Errorf("IdleConnTimeout=%v want 30s", htr.IdleConnTimeout)

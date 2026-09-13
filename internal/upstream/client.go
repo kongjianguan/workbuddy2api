@@ -5,6 +5,7 @@ package upstream
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -313,10 +314,11 @@ func New() *Client {
 		MaxIdleConnsPerHost: 20,
 		IdleConnTimeout:     30 * time.Second,
 		TLSHandshakeTimeout: 10 * time.Second,
-		// 强制 HTTP/1.1：上游 HTTP/2 半死连接被复用时表现为
-		// "http2: timeout awaiting response headers"，重启容器才恢复。
-		// HTTP/1.1 每请求一条连接，坏连接不会拖累后续请求。
-		ForceAttemptHTTP2: false,
+		// 强制 HTTP/1.1：空 TLSNextProto 才会真正关掉 HTTP/2。
+		// ForceAttemptHTTP2=false 只在自定义 Dial 时生效；默认 TLS 仍会
+		// 通过 ALPN 协商出 h2，半死流被复用后继续报
+		// "http2: timeout awaiting response headers"。
+		TLSNextProto: make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
 		// 聊天 SSE 首字节前硬上限（对短 RPC 无实际影响：其总时长 120s 更先到期）。
 		ResponseHeaderTimeout: 120 * time.Second,
 	}
