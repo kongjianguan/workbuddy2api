@@ -18,9 +18,17 @@ Codex  →  :7865  responses-proxy
 
 上游网关（原作者 `workbuddy2api`）先在 `:7863` 跑着。
 
-```sh
-go run ./cmd/responses-proxy -listen :7865 -upstream http://127.0.0.1:7863
+原作者网关没有 `model_aliases`。需要把 Codex 的模型名改成上游名时，给代理一份 JSON 映射：
+
+```json
+{"gpt-6-astra":"glm-5.3-flash","gpt-5.6-sol":"deepseek-v4.1-flash"}
 ```
+
+```sh
+go run ./cmd/responses-proxy -listen :7865 -upstream http://127.0.0.1:7863 -aliases aliases.json
+```
+
+未命中的名字原样转发。
 
 Codex 的 `base_url` 指 `http://127.0.0.1:7865/v1`，`wire_api = "responses"`。
 密钥仍用上游 `config.json` 的 `api_key`（代理原样转发 `Authorization`）。

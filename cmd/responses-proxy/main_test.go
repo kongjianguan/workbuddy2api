@@ -68,6 +68,35 @@ func TestResponsesProxyConvertsStream(t *testing.T) {
 	}
 }
 
+func TestApplyModelAliasRewritesChatBody(t *testing.T) {
+	var gotModel string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var chat map[string]any
+		_ = json.Unmarshal(b, &chat)
+		gotModel, _ = chat["model"].(string)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"c1","object":"chat.completion","created":1,"model":"glm-5.3-flash","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	}))
+	defer up.Close()
+	u, _ := url.Parse(up.URL)
+	s := &server{
+		upstream: u,
+		client:   &http.Client{Timeout: 5 * time.Second},
+		aliases:  map[string]string{"gpt-5.6-sol": "deepseek-v4.1-flash"},
+	}
+	body := `{"model":"gpt-5.6-sol","stream":false,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`
+	req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.responses(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if gotModel != "deepseek-v4.1-flash" {
+		t.Errorf("upstream model=%q want deepseek-v4.1-flash", gotModel)
+	}
+}
+
 func TestResponsesProxyConvertsSync(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

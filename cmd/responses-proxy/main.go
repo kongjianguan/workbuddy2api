@@ -23,6 +23,7 @@ import (
 func main() {
 	listen := flag.String("listen", ":7865", "listen address")
 	upstream := flag.String("upstream", "http://127.0.0.1:7863", "chat-completions gateway base URL")
+	aliasFile := flag.String("aliases", "", "JSON object of client model → upstream model (optional)")
 	flag.Parse()
 
 	u, err := url.Parse(*upstream)
@@ -30,8 +31,14 @@ func main() {
 		log.Fatalf("upstream URL: %v", err)
 	}
 
+	aliases, err := loadAliases(*aliasFile)
+	if err != nil {
+		log.Fatalf("aliases: %v", err)
+	}
+
 	s := &server{
 		upstream: u,
+		aliases:  aliases,
 		client: &http.Client{
 			Timeout: 0, // 流式聊天无总时长上限
 			Transport: &http.Transport{
@@ -51,7 +58,7 @@ func main() {
 	mux.HandleFunc("GET /healthz", s.healthz)
 	mux.HandleFunc("/", s.passthrough)
 
-	log.Printf("responses-proxy listening on %s → %s", *listen, u.String())
+	log.Printf("responses-proxy listening on %s → %s (%d aliases)", *listen, u.String(), len(aliases))
 	if err := http.ListenAndServe(*listen, mux); err != nil {
 		log.Fatal(err)
 	}
@@ -59,8 +66,50 @@ func main() {
 
 type server struct {
 	upstream *url.URL
+	aliases  map[string]string
 	client   *http.Client
 	proxy    *httputil.ReverseProxy
+}
+
+func loadAliases(path string) (map[string]string, error) {
+	if path == "" {
+		return nil, nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]string
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func applyModelAlias(body []byte, model *string, aliases map[string]string) []byte {
+	if len(aliases) == 0 || model == nil || *model == "" {
+		return body
+	}
+	target, ok := aliases[*model]
+	if !ok || target == "" {
+		return body
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(body, &obj) != nil {
+		return body
+	}
+	raw, err := json.Marshal(target)
+	if err != nil {
+		return body
+	}
+	obj["model"] = raw
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	log.Printf("model alias %s -> %s", *model, target)
+	*model = target
+	return out
 }
 
 func (s *server) healthz(w http.ResponseWriter, r *http.Request) {
@@ -83,6 +132,7 @@ func (s *server) responses(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	chatBody = applyModelAlias(chatBody, &req.Model, s.aliases)
 
 	upURL := s.upstream.ResolveReference(&url.URL{Path: "/v1/chat/completions"})
 	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upURL.String(), bytes.NewReader(chatBody))

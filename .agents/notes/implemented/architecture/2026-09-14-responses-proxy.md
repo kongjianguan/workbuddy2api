@@ -30,7 +30,9 @@ Responses。其它路径（含 `/v1/models`、chat）用反向代理原样转发
 ## Consequences
 
 - Codex 指 `:7865`，原作者网关仍占 `:7863`；多一跳本机 HTTP，无额外 Python 进程
-- 模型别名、选号、冷却仍在上游网关；代理无状态，可随时重启
+- 选号、冷却仍在上游网关。原作者网关没有 `model_aliases`，映射改由代理
+  `-aliases` JSON 文件在转换后改写 Chat 请求的 `model` 字段
+- 代理无状态（别名文件启动时读一次），可随时重启
 - 上游 4xx/5xx 原样回传，不包装成 Responses 错误（Codex 能显示上游 JSON）
 - 流式路径在写出 SSE 之前已经 `WriteHeader(200)`（`StreamTranslator.Run` 既有行为）
 
