@@ -315,14 +315,22 @@ func New() *Client {
 		KeepAlive: 15 * time.Second, // 探测对端/NAT 黑洞，默认 2h 才探
 	}
 	tr := &http.Transport{
-		DialContext:           dialer.DialContext,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			c, err := dialer.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			// ResponseHeaderTimeout 要等请求体写完才开始计时。半开 TCP 卡在 write
+			// 时会拖到系统重传窗口（实测 15 分钟）。给每条出站连接加写超时。
+			return &timedConn{Conn: c, writeTimeout: 20 * time.Second}, nil
+		},
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   20,
 		IdleConnTimeout:       30 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		DisableKeepAlives:     true, // 不复用：半开 TCP 被 keep-alive 复用会卡在 write timeout（可达十几分钟）
 		TLSNextProto:          make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
-		ResponseHeaderTimeout: 120 * time.Second,
+		ResponseHeaderTimeout: 20 * time.Second,
 	}
 	return &Client{
 		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
@@ -331,6 +339,21 @@ func New() *Client {
 		ChatBaseCN:           "https://copilot.tencent.com",
 		BillingBaseCN:        "https://www.codebuddy.cn",
 	}
+}
+
+// timedConn 给 Write 加绝对截止时间，避免半开 TCP 卡在系统重传窗口。
+type timedConn struct {
+	net.Conn
+	writeTimeout time.Duration
+}
+
+func (c *timedConn) Write(p []byte) (int, error) {
+	if c.writeTimeout > 0 {
+		if err := c.Conn.SetWriteDeadline(time.Now().Add(c.writeTimeout)); err != nil {
+			return 0, err
+		}
+	}
+	return c.Conn.Write(p)
 }
 
 // chatHTTP 返回聊天专用 client；未设置（如测试只注入 HTTP）时回落 HTTP。

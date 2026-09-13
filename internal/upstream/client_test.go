@@ -463,9 +463,9 @@ func TestNewChatClientNoTotalTimeoutAndSharedTransport(t *testing.T) {
 	if !ok {
 		t.Fatalf("Transport type=%T", c.ChatHTTP.Transport)
 	}
-		if htr.ResponseHeaderTimeout != 120*time.Second {
-			t.Errorf("ResponseHeaderTimeout=%v want 120s", htr.ResponseHeaderTimeout)
-		}
+			if htr.ResponseHeaderTimeout != 20*time.Second {
+				t.Errorf("ResponseHeaderTimeout=%v want 20s", htr.ResponseHeaderTimeout)
+			}
 		if htr.TLSNextProto == nil {
 			t.Error("TLSNextProto must be non-nil empty map to disable HTTP/2")
 		}

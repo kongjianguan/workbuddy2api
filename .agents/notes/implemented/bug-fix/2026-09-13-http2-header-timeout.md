@@ -28,6 +28,11 @@ Status: implemented
 因此再关掉连接复用（`DisableKeepAlives`），并给 Dialer 设 `Timeout=10s`、
 `KeepAlive=15s`。每次聊天新建 TCP+TLS，半开连接无法再被下一请求捡到。
 
+关掉复用之后，多数 glm 请求 TTFB 仍是 200–400ms，但偶发请求 TTFB 到 130s / 178s / 942s。
+`ResponseHeaderTimeout` 要等请求体写完才开始计时，半开 TCP 卡在 write 时 120s 上限用不上。
+给每条出站连接加 20s 写超时（`timedConn`），并把 `ResponseHeaderTimeout` 降到 20s，
+失败后换号最多约 20s 而不是 2–15 分钟。
+
 ## Alternatives considered
 
 **保留 HTTP/2，加 ping / ReadIdleTimeout。** Go 标准库 Transport 对 HTTP/2 没有
@@ -49,6 +54,6 @@ Status: implemented
 
 ## Testing
 
-- `TestNewChatClientNoTotalTimeoutAndSharedTransport` 断言 `ForceAttemptHTTP2=false`
-  且 `IdleConnTimeout=30s`
+- `TestNewChatClientNoTotalTimeoutAndSharedTransport` 断言空 `TLSNextProto`、
+  `DisableKeepAlives`、`ResponseHeaderTimeout=20s`、`IdleConnTimeout=30s`
 - `go vet ./...` 与 `go test ./internal/upstream/` 覆盖连接池共享与超时语义
