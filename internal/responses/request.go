@@ -74,7 +74,7 @@ func NewToolContext(tools []Tool) (*ToolContext, []map[string]any) {
 			// 改为转成名为 tool_search 的普通 function（与 cc-switch 同做法）：
 			// 模型能看见并调用它；Codex 客户端收到调用后自行执行搜索，
 			// 再把结果作为 tool_search_output 回传（其中带新发现的工具，
-			// 由 collectToolSearchOutputTools 收集后加入后续请求）。
+			// 由 collectInputDiscoveredTools 收集后加入后续请求）。
 			ctx.chatNameToSpec[toolSearchName] = ToolSpec{Kind: ToolSearch, Name: toolSearchName}
 			ctx.chatTools = append(ctx.chatTools, toolSearchToChatTool(t))
 		default:
@@ -294,13 +294,14 @@ func BuildChatRequest(req *Request) (*ChatRequest, *ToolContext, error) {
 		})
 	}
 
-	// tool_search 发现的新工具：从 input 里的 tool_search_output item 提取并加入
-	// tools。必须在 buildMessages 之前做——那些工具也要参与本轮的 messages 转换
+	// input 里自带的工具定义：tool_search 发现的新工具（tool_search_output item）
+	// 与新版 Codex 的全量工具集（additional_tools item，顶层 tools 字段为空）。
+	// 必须在 buildMessages 之前做——那些工具也要参与本轮的 messages 转换
 	// （例如它们的 function_call 历史需要按正确类型还原）。
-	// 必须在这里而非 NewToolContext 里做：搜索结果是 input 的一部分，而
+	// 必须在这里而非 NewToolContext 里做：这些 item 是 input 的一部分，而
 	// NewToolContext 只看顶层 tools 字段。
 	if raw := rawInputValue(req.Input); raw != nil {
-		collectToolSearchOutputTools(raw, toolCtx)
+		collectInputDiscoveredTools(raw, toolCtx)
 		if len(toolCtx.chatTools) > len(out.Tools) {
 			out.Tools = toolCtx.chatTools
 		}
@@ -501,7 +502,7 @@ func buildMessages(input json.RawMessage, toolCtx *ToolContext) ([]ChatMessage, 
 
 		case "tool_search_output":
 			// 工具搜索结果要作为 tool 消息回给上游，模型才知道搜到了什么。
-			// 工具定义本身由 collectToolSearchOutputTools 单独收集（它需要遍历
+			// 工具定义本身由 collectInputDiscoveredTools 单独收集（它需要遍历
 			// 整个 input，因为 output 可能嵌在非数组结构里），这里只负责把结果
 			// 内容喂给模型。
 			flushPending()
@@ -735,21 +736,26 @@ func toolSearchToChatTool(t Tool) map[string]any {
 	}
 }
 
-// collectToolSearchOutputTools 从 input 里提取 tool_search 发现的新工具。
+// collectInputDiscoveredTools 从 input 里提取"顶层 tools 之外"的工具定义。
 //
-// 工作方式：Codex 执行搜索后，把结果作为 tool_search_output item 放进下一轮
-// input，其 tools 数组是完整的 Responses 工具定义。这些工具必须出现在本轮
-// 发给上游的 tools 里，模型才能调用它们——否则搜索结果等于没给。
+// 两个来源，形状同为 {type, tools:[完整 Responses 工具定义]}：
+//   - tool_search_output：Codex 执行搜索后，把结果作为 item 放进下一轮 input，
+//     其 tools 数组是搜索发现的完整工具定义。这些工具必须出现在本轮发给上游的
+//     tools 里，模型才能调用它们——否则搜索结果等于没给。
+//   - additional_tools：新版 Codex（0.154+）不再把工具放顶层 tools 字段，而是
+//     作为 `{"type":"additional_tools","role":"developer","tools":[...]}` item 塞进
+//     input（namespace + custom 的完整工具集）。转换器若不认这个类型，工具会被
+//     静默丢光——模型只剩文字可用，表现就是"宣布要调工具然后没了下文"。
 //
-// 递归遍历（而非只看 input 顶层）：output 可能嵌在任意深度的结构里。
-func collectToolSearchOutputTools(v any, ctx *ToolContext) {
+// 递归遍历（而非只看 input 顶层）：item 可能嵌在任意深度的结构里。
+func collectInputDiscoveredTools(v any, ctx *ToolContext) {
 	switch t := v.(type) {
 	case []any:
 		for _, e := range t {
-			collectToolSearchOutputTools(e, ctx)
+			collectInputDiscoveredTools(e, ctx)
 		}
 	case map[string]any:
-		if strOf(t["type"]) == "tool_search_output" {
+		if kind := strOf(t["type"]); kind == "tool_search_output" || kind == "additional_tools" {
 			if arr, ok := t["tools"].([]any); ok {
 				for _, raw := range arr {
 					ctx.addDiscoveredTool(raw)
@@ -757,7 +763,7 @@ func collectToolSearchOutputTools(v any, ctx *ToolContext) {
 			}
 		}
 		for _, e := range t {
-			collectToolSearchOutputTools(e, ctx)
+			collectInputDiscoveredTools(e, ctx)
 		}
 	}
 }

@@ -377,3 +377,45 @@ func TestToolSearchCallItemConverted(t *testing.T) {
 		t.Errorf("tool_search_call 未转成 Chat tool_call: %+v", out.Messages)
 	}
 }
+
+// additional_tools input item：新版 Codex（0.154+）把工具定义放进 input 的
+// additional_tools item（namespace + custom），顶层 tools 字段为空。
+// 转换器必须从中收集工具，否则上游收不到任何工具定义——模型只能用文字
+// "宣布要调工具"，调用永远不发生（2026-09-13 线上事故，抓包定位）。
+func TestBuildChatRequest_AdditionalToolsItem(t *testing.T) {
+	req := &Request{
+		Model: "gpt-6-astra",
+		Input: json.RawMessage(`[
+			{"type":"additional_tools","id":"at_1","role":"developer","tools":[
+				{"type":"namespace","name":"functions","description":"","tools":[
+					{"type":"custom","name":"exec","description":"Run JS"}
+				]},
+				{"type":"function","name":"get_weather","description":"天气",
+				 "parameters":{"type":"object","properties":{"city":{"type":"string"}}}}
+			]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"现在几点？"}]}
+		]`),
+	}
+	out, _, err := BuildChatRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Tools) == 0 {
+		t.Fatal("additional_tools 里的工具未被收集：上游将收不到任何工具定义")
+	}
+	names := map[string]bool{}
+	for _, tl := range out.Tools {
+		fn, _ := tl["function"].(map[string]any)
+		names[fn["name"].(string)] = true
+	}
+	// namespace 扁平化 + 顶层 function 都要进工具集
+	for _, want := range []string{"functions__exec", "get_weather"} {
+		if !names[want] {
+			t.Errorf("工具 %q 未出现在转换结果: %v", want, names)
+		}
+	}
+	// assistant 消息不受影响
+	if len(out.Messages) != 1 || out.Messages[0].Role != "user" {
+		t.Errorf("additional_tools 不应产出消息: %+v", out.Messages)
+	}
+}
