@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"regexp"
 	"strings"
@@ -309,17 +310,18 @@ type Client struct {
 
 // New 生产默认值。配置连接池减少 TLS 握手。
 func New() *Client {
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 15 * time.Second, // 探测对端/NAT 黑洞，默认 2h 才探
+	}
 	tr := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     30 * time.Second,
-		TLSHandshakeTimeout: 10 * time.Second,
-		// 强制 HTTP/1.1：空 TLSNextProto 才会真正关掉 HTTP/2。
-		// ForceAttemptHTTP2=false 只在自定义 Dial 时生效；默认 TLS 仍会
-		// 通过 ALPN 协商出 h2，半死流被复用后继续报
-		// "http2: timeout awaiting response headers"。
-		TLSNextProto: make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
-		// 聊天 SSE 首字节前硬上限（对短 RPC 无实际影响：其总时长 120s 更先到期）。
+		DialContext:           dialer.DialContext,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		IdleConnTimeout:       30 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		DisableKeepAlives:     true, // 不复用：半开 TCP 被 keep-alive 复用会卡在 write timeout（可达十几分钟）
+		TLSNextProto:          make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
 		ResponseHeaderTimeout: 120 * time.Second,
 	}
 	return &Client{

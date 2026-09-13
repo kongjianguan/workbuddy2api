@@ -475,6 +475,9 @@ func TestNewChatClientNoTotalTimeoutAndSharedTransport(t *testing.T) {
 		if htr.IdleConnTimeout != 30*time.Second {
 			t.Errorf("IdleConnTimeout=%v want 30s", htr.IdleConnTimeout)
 		}
+		if !htr.DisableKeepAlives {
+			t.Error("DisableKeepAlives should be true: reused half-open TCP stalls on write")
+		}
 	}
 
 func TestChatStreamRoutesToChatHTTP(t *testing.T) {

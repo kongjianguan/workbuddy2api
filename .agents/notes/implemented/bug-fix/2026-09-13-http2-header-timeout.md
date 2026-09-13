@@ -21,8 +21,12 @@ Status: implemented
 `TLSHandshakeTimeout=10s`。聊天传输层失败时调用 `CloseIdleConnections()`，避免
 下一次请求再捡到刚失败的连接。
 
-HTTP/1.1 每请求一条连接（keep-alive 仍复用，但没有 h2 多路复用流），半死连接
-不会拖累后续请求。这是针对当前故障形态的最小修复，不引入连接健康探测。
+关掉 HTTP/2 之后，故障变成 `write tcp ... connection timed out`，单次 TTFB 到
+936s（Linux 对半开 TCP 的重传窗口）。根因换成：keep-alive 复用了已被对端/NAT
+掐掉的连接，默认 Dialer 没有短 keepalive、也没有 10s Dial timeout。
+
+因此再关掉连接复用（`DisableKeepAlives`），并给 Dialer 设 `Timeout=10s`、
+`KeepAlive=15s`。每次聊天新建 TCP+TLS，半开连接无法再被下一请求捡到。
 
 ## Alternatives considered
 
