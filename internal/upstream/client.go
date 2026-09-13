@@ -311,7 +311,12 @@ func New() *Client {
 	tr := &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
+		IdleConnTimeout:     30 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+		// 强制 HTTP/1.1：上游 HTTP/2 半死连接被复用时表现为
+		// "http2: timeout awaiting response headers"，重启容器才恢复。
+		// HTTP/1.1 每请求一条连接，坏连接不会拖累后续请求。
+		ForceAttemptHTTP2: false,
 		// 聊天 SSE 首字节前硬上限（对短 RPC 无实际影响：其总时长 120s 更先到期）。
 		ResponseHeaderTimeout: 120 * time.Second,
 	}
@@ -330,6 +335,17 @@ func (c *Client) chatHTTP() *http.Client {
 		return c.ChatHTTP
 	}
 	return c.HTTP
+}
+
+// closeIdleConns 丢掉连接池里的空闲连接。传输层失败后调用：
+// 半死 HTTP/2 连接被复用会让后续请求继续卡在 ResponseHeaderTimeout。
+func (c *Client) closeIdleConns() {
+	if c == nil {
+		return
+	}
+	if tr, ok := c.chatHTTP().Transport.(*http.Transport); ok {
+		tr.CloseIdleConnections()
+	}
 }
 
 func (c *Client) chatBase(a *auth.Auth) string {
@@ -447,12 +463,13 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string) (rc io.R
 	c.ChatHeaders(req, a, clientIP)
 	ctx, cancel := context.WithCancel(context.Background())
 	req = req.WithContext(ctx)
-	resp, err := c.chatHTTP().Do(req)
-	if err != nil {
-		cancel()
-		log.Printf("ERR: [upstream] chat_stream uid=%s: transport error: %v", logfmt.UID8(a.UID), err)
-		return nil, 0, nil, err
-	}
+		resp, err := c.chatHTTP().Do(req)
+		if err != nil {
+			cancel()
+			log.Printf("ERR: [upstream] chat_stream uid=%s: transport error: %v", logfmt.UID8(a.UID), err)
+			c.closeIdleConns()
+			return nil, 0, nil, err
+		}
 	if resp.StatusCode >= 400 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()

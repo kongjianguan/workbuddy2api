@@ -463,10 +463,16 @@ func TestNewChatClientNoTotalTimeoutAndSharedTransport(t *testing.T) {
 	if !ok {
 		t.Fatalf("Transport type=%T", c.ChatHTTP.Transport)
 	}
-	if htr.ResponseHeaderTimeout != 120*time.Second {
-		t.Errorf("ResponseHeaderTimeout=%v want 120s", htr.ResponseHeaderTimeout)
+		if htr.ResponseHeaderTimeout != 120*time.Second {
+			t.Errorf("ResponseHeaderTimeout=%v want 120s", htr.ResponseHeaderTimeout)
+		}
+		if htr.ForceAttemptHTTP2 {
+			t.Error("ForceAttemptHTTP2 should be false: HTTP/2 idle streams stall as header timeout")
+		}
+		if htr.IdleConnTimeout != 30*time.Second {
+			t.Errorf("IdleConnTimeout=%v want 30s", htr.IdleConnTimeout)
+		}
 	}
-}
 
 func TestChatStreamRoutesToChatHTTP(t *testing.T) {
 	// 显式注入 ChatHTTP（可辨识标记），验证 ChatStream 走它而非 HTTP。
