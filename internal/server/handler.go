@@ -251,7 +251,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	h.executeChat(w, body, peek, chatExecHooks{})
+	h.executeChat(w, r, body, peek, chatExecHooks{})
 }
 
 // chatPeek 是请求体的轻量投影：选号需要 model（模型级冷却豁免），
@@ -343,7 +343,8 @@ func applyModelAlias(body []byte, peek *chatPeek, aliases map[string]string) []b
 // executeChat 执行一次 chat 请求的完整链路：提示词改写 → 选号 → 轮转 →
 // 错误处置 → 输出。body 必须是标准 Chat Completions 请求体
 // （/v1/responses 的调用方已先把 Responses 请求转成 Chat）。
-func (h *Handler) executeChat(w http.ResponseWriter, body []byte, peek chatPeek, hooks chatExecHooks) {
+// r 是入站请求：仅用于按请求提取客户端 IP（PassthroughIP），不做其他读取。
+func (h *Handler) executeChat(w http.ResponseWriter, r *http.Request, body []byte, peek chatPeek, hooks chatExecHooks) {
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
 	defer st.done()

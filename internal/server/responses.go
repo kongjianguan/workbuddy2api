@@ -45,7 +45,7 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 			return responses.UsageTokens(out), nil
 		},
 	}
-	h.executeChat(w, chatBody, peek, hooks)
+	h.executeChat(w, r, chatBody, peek, hooks)
 }
 
 // 保证 upstream 包被引用（Aggregate 在 hooks 外部路径仍需要）。
