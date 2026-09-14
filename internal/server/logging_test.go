@@ -282,3 +282,37 @@ func TestHealthzDoesNotLogTableRow(t *testing.T) {
 		t.Errorf("healthz/models/status must not emit table rows:\n%s", out)
 	}
 }
+
+// TestStreamMissingUsageLogsDashNotZero 覆盖「usage 缺失被记成 tok=0」的缺陷。
+//
+// 上游在 usage 帧之前断流时没有 usage。计数器零值是 0，若丢掉 Tokens() 的 ok
+// 标志，日志会打 tok=0——与「真返回 0 token」完全无法区分，实测排障时把人
+// 引向「上游返回空响应」的错误方向。缺失必须显示 "-"。
+func TestStreamMissingUsageLogsDashNotZero(t *testing.T) {
+	withChatLog(t)
+	// 只有内容帧与 [DONE]，没有 usage 帧
+	const sseNoUsage = "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, sseNoUsage, true
+	})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	out := captureStdout(t, func() {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[]}`))
+		h.ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("code=%d", rec.Code)
+		}
+	})
+	if !strings.Contains(out, "tok=-") {
+		t.Errorf("usage 缺失应显示 tok=-，实际输出:\n%s", out)
+	}
+	if strings.Contains(out, "tok=0") {
+		t.Errorf("usage 缺失被误记为 tok=0（正是要修的缺陷）:\n%s", out)
+	}
+}

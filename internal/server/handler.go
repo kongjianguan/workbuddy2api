@@ -523,7 +523,12 @@ func (h *Handler) executeChat(w http.ResponseWriter, r *http.Request, body []byt
 			stats := newChatStatsReaderSince(rc, st.start)
 			_ = upstream.Stream(w, stats)
 			st.ttfb = stats.TTFB()
-			st.toks, _ = stats.Tokens()
+			// 只在拿到 usage 时采信 token 数：否则保持 -1，日志显示 "-"。
+			// 丢掉 ok 会把「usage 缺失」记成 tok=0，与「真返回 0 token」混淆——
+			// 上游在 usage 帧之前断流时就会出现这种假 0。
+			if toks, ok := stats.Tokens(); ok {
+				st.toks = toks
+			}
 			// 成本账本：末帧 usage 带 credit 与 token 总数时记录实测单价，
 			// 供下次选号把免费/便宜的号排在前面。
 			if credit, ok := stats.Credit(); ok {

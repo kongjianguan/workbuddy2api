@@ -29,7 +29,8 @@ func main() {
 	listen := flag.String("listen", ":7865", "listen address")
 	upstream := flag.String("upstream", "http://127.0.0.1:7863", "chat-completions gateway base URL")
 	aliasFile := flag.String("aliases", "", "JSON object of client model → upstream model (optional)")
-	watchdogTimeout := flag.Duration("watchdog-timeout", 15*time.Second, "timeout waiting for first token chunk before retrying")
+	watchdogTimeout := flag.Duration("watchdog-timeout", 15*time.Second, "max wait for first real content before retrying")
+	idleTimeout := flag.Duration("stream-idle-timeout", 45*time.Second, "max gap between content frames once streaming has started")
 	maxRetries := flag.Int("max-retries", 1, "maximum silent retry attempts on upstream stall or retryable errors")
 	dumpDir := flag.String("dump-dir", "", "directory to dump raw requests and error payloads for debugging (optional)")
 	flag.Parse()
@@ -50,6 +51,7 @@ func main() {
 		upstream:        u,
 		aliases:         aliases,
 		watchdogTimeout: *watchdogTimeout,
+		idleTimeout:     *idleTimeout,
 		maxRetries:      *maxRetries,
 		dumper:          dumper,
 		client: &http.Client{
@@ -72,8 +74,8 @@ func main() {
 	mux.HandleFunc("GET /healthz", s.healthz)
 	mux.HandleFunc("/", s.passthrough)
 
-	log.Printf("responses-proxy listening on %s → %s (%d aliases, watchdog=%v, max_retries=%d, dump=%q)",
-		*listen, u.String(), len(aliases), *watchdogTimeout, *maxRetries, *dumpDir)
+	log.Printf("responses-proxy listening on %s → %s (%d aliases, first-content=%v, stream-idle=%v, max_retries=%d, dump=%q)",
+		*listen, u.String(), len(aliases), *watchdogTimeout, *idleTimeout, *maxRetries, *dumpDir)
 	if err := http.ListenAndServe(*listen, mux); err != nil {
 		log.Fatal(err)
 	}
@@ -83,6 +85,7 @@ type server struct {
 	upstream        *url.URL
 	aliases         map[string]string
 	watchdogTimeout time.Duration
+	idleTimeout     time.Duration
 	maxRetries      int
 	dumper          *RequestDumper
 	client          *http.Client
@@ -250,8 +253,8 @@ func (s *server) responses(w http.ResponseWriter, r *http.Request) {
 			// 单读者看门狗：唯一的读取 goroutine 独占上游 body，同时负责
 			// 首包探测与中途空闲检测。绝不能出现第二个读者——否则它会抢走
 			// tool_calls 首帧（带 id 的那帧）导致客户端解析报错。
-			ws := newWatchdogStream(r.Context(), resp.Body, s.watchdogTimeout)
-			prefix, err := readUntilActualContent(ws)
+			ws := newWatchdogStream(r.Context(), resp.Body, s.watchdogTimeout, s.idleTimeout)
+			prefix, err := readUntilFirstContent(ws)
 			if err != nil {
 				_ = ws.Close()
 				if isStallError(err) && attempt < maxAttempts {
@@ -373,8 +376,8 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if isStream {
 			// 单读者看门狗：见 responses 分支的同名注释——第二个读者会抢走
 			// tool_calls 首帧（带 id），导致客户端报 "Expected 'id' to be a string."
-			ws := newWatchdogStream(r.Context(), resp.Body, s.watchdogTimeout)
-			prefix, err := readUntilActualContent(ws)
+			ws := newWatchdogStream(r.Context(), resp.Body, s.watchdogTimeout, s.idleTimeout)
+			prefix, err := readUntilFirstContent(ws)
 			if err != nil {
 				_ = ws.Close()
 				if isStallError(err) && attempt < maxAttempts {
