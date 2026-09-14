@@ -190,6 +190,12 @@ func (s *server) responses(w http.ResponseWriter, r *http.Request) {
 	origModel := req.Model
 	chatBody = applyModelAlias(chatBody, &req.Model, s.aliases)
 
+	// 转换后的 Chat 体同样可能带着历史里不成对的工具调用 id。
+	if fixed, changed := sanitizeToolCallIDs(chatBody); changed {
+		chatBody = fixed
+		log.Printf("[sanitize] repaired unpaired tool_call ids")
+	}
+
 	upURL := s.upstream.ResolveReference(&url.URL{Path: "/v1/chat/completions"})
 	maxAttempts := s.maxRetries + 1
 
@@ -307,7 +313,14 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, origModel, targetModel := applyModelAliasChat(rawClientBody, s.aliases)
+	// 修复历史里不成对的工具调用 id（上游对空串/不配对一律 400 model_param_invalid）。
+	clientBody := rawClientBody
+	if fixed, changed := sanitizeToolCallIDs(rawClientBody); changed {
+		clientBody = fixed
+		log.Printf("[sanitize] repaired unpaired tool_call ids")
+	}
+
+	body, origModel, targetModel := applyModelAliasChat(clientBody, s.aliases)
 	upURL := s.upstream.ResolveReference(&url.URL{Path: "/v1/chat/completions"})
 	maxAttempts := s.maxRetries + 1
 
