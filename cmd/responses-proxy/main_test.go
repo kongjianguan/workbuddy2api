@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -27,8 +28,10 @@ func TestResponsesProxyConvertsStream(t *testing.T) {
 
 	u, _ := url.Parse(up.URL)
 	s := &server{
-		upstream: u,
-		client:   &http.Client{Timeout: 5 * time.Second},
+		upstream:        u,
+		watchdogTimeout: 2 * time.Second,
+		maxRetries:      1,
+		client:          &http.Client{Timeout: 5 * time.Second},
 	}
 
 	body := `{
@@ -81,9 +84,11 @@ func TestApplyModelAliasRewritesChatBody(t *testing.T) {
 	defer up.Close()
 	u, _ := url.Parse(up.URL)
 	s := &server{
-		upstream: u,
-		client:   &http.Client{Timeout: 5 * time.Second},
-		aliases:  map[string]string{"gpt-5.6-sol": "deepseek-v4.1-flash"},
+		upstream:        u,
+		client:          &http.Client{Timeout: 5 * time.Second},
+		watchdogTimeout: 2 * time.Second,
+		maxRetries:      1,
+		aliases:         map[string]string{"gpt-5.6-sol": "deepseek-v4.1-flash"},
 	}
 	body := `{"model":"gpt-5.6-sol","stream":false,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`
 	req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body))
@@ -97,52 +102,125 @@ func TestApplyModelAliasRewritesChatBody(t *testing.T) {
 	}
 }
 
-func TestResponsesProxyConvertsSync(t *testing.T) {
+func TestResponsesProxyWatchdogSilentRetryOnStall(t *testing.T) {
+	var attempts int32
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"id":"c1","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+		n := atomic.AddInt32(&attempts, 1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if n == 1 {
+			// 第一次尝试：模拟上游恶劣行为（秒回 200，挂起 1 秒不发任何数据）
+			time.Sleep(500 * time.Millisecond)
+			return
+		}
+		// 第二次重试：正常下发数据
+		_, _ = io.WriteString(w, "data: {\"id\":\"c2\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"recovered\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
 	}))
 	defer up.Close()
-	u, _ := url.Parse(up.URL)
-	s := &server{upstream: u, client: &http.Client{Timeout: 5 * time.Second}}
 
-	body := `{"model":"m","stream":false,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`
+	u, _ := url.Parse(up.URL)
+	s := &server{
+		upstream:        u,
+		watchdogTimeout: 100 * time.Millisecond, // 测试环境设为 100ms
+		maxRetries:      1,
+		client:          &http.Client{Timeout: 5 * time.Second},
+	}
+
+	body := `{"model":"m","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`
 	req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	s.responses(rec, req)
+
 	if rec.Code != 200 {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	var out map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
-		t.Fatal(err)
+	if atomic.LoadInt32(&attempts) != 2 {
+		t.Fatalf("expected 2 attempts, got %d", attempts)
 	}
-	if out["object"] != "response" {
-		t.Errorf("object=%v", out["object"])
-	}
-	if out["status"] != "completed" {
-		t.Errorf("status=%v", out["status"])
+	if !strings.Contains(rec.Body.String(), "recovered") {
+		t.Fatalf("expected response to contain 'recovered', got %s", rec.Body.String())
 	}
 }
 
-func TestResponsesProxyForwardsUpstreamError(t *testing.T) {
+func TestResponsesProxyWatchdogTimeoutExhausted(t *testing.T) {
+	var attempts int32
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = io.WriteString(w, `{"error":{"message":"bad key"}}`)
+		atomic.AddInt32(&attempts, 1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		// 每次尝试均假死
+		time.Sleep(300 * time.Millisecond)
 	}))
 	defer up.Close()
-	u, _ := url.Parse(up.URL)
-	s := &server{upstream: u, client: &http.Client{Timeout: 5 * time.Second}}
 
-	body := `{"model":"m","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`
+	u, _ := url.Parse(up.URL)
+	s := &server{
+		upstream:        u,
+		watchdogTimeout: 50 * time.Millisecond,
+		maxRetries:      1, // 最多 2 次
+		client:          &http.Client{Timeout: 5 * time.Second},
+	}
+
+	body := `{"model":"m","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`
 	req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	s.responses(rec, req)
-	if rec.Code != 401 {
-		t.Fatalf("status=%d want 401 body=%s", rec.Code, rec.Body.String())
+
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status=%d want 504 body=%s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "bad key") {
-		t.Errorf("body=%s", rec.Body.String())
+	if atomic.LoadInt32(&attempts) != 2 {
+		t.Fatalf("expected 2 attempts before giving up, got %d", attempts)
+	}
+	if !strings.Contains(rec.Body.String(), "upstream stalled") {
+		t.Fatalf("expected error message to mention upstream stalled, got %s", rec.Body.String())
+	}
+}
+
+func TestChatCompletionsAliasAndWatchdog(t *testing.T) {
+	var attempts int32
+	var gotModel string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&attempts, 1)
+		b, _ := io.ReadAll(r.Body)
+		var chat map[string]any
+		_ = json.Unmarshal(b, &chat)
+		gotModel, _ = chat["model"].(string)
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		if n == 1 {
+			time.Sleep(300 * time.Millisecond)
+			return
+		}
+		_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"pong\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer up.Close()
+
+	u, _ := url.Parse(up.URL)
+	s := &server{
+		upstream:        u,
+		watchdogTimeout: 50 * time.Millisecond,
+		maxRetries:      1,
+		aliases:         map[string]string{"gpt-5.6-sol": "deepseek-v4.1-flash"},
+		client:          &http.Client{Timeout: 5 * time.Second},
+	}
+
+	body := `{"model":"gpt-5.6-sol","stream":true,"messages":[{"role":"user","content":"ping"}]}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.chatCompletions(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if gotModel != "deepseek-v4.1-flash" {
+		t.Errorf("model alias not applied, got=%s want=deepseek-v4.1-flash", gotModel)
+	}
+	if atomic.LoadInt32(&attempts) != 2 {
+		t.Fatalf("expected 2 attempts, got %d", attempts)
+	}
+	if !strings.Contains(rec.Body.String(), "pong") {
+		t.Fatalf("missing pong in body: %s", rec.Body.String())
 	}
 }
