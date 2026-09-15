@@ -416,6 +416,17 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					if rerr != io.EOF {
 						log.Printf("[watchdog] chat stream: %v", rerr)
 					}
+					// 上游中途断流时，光断开连接会让客户端把「截断」读成
+					// 「协议异常」——DSH 的 parseSse 缺 [DONE] 直接抛
+					// STREAM_CLOSED，用户看到的是报错而不是可重试的失败。
+					// 补一个终止帧把结果收敛成明确的结束语义。
+					// 此类流已写过响应头，无法再改状态码，补帧是唯一的收尾手段。
+					if frame := ws.terminationFrame(); frame != "" {
+						_, _ = w.Write([]byte(frame))
+						if ok {
+							flusher.Flush()
+						}
+					}
 					break
 				}
 			}

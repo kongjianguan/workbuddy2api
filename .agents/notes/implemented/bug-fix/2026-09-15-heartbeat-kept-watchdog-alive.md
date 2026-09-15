@@ -73,7 +73,9 @@ Status: implemented
   看门狗仍按首包阈值掐断，且期间心跳次数不超过阈值窗口（旧实现会一直跑到测试超时）
 - `TestIdleWatchdogAbortsAfterContentThenSilence` — 先出内容再只发心跳，断言中途
   闸门生效，且已到达的内容已透传
-- `TestFrameProgressClassification` — 固定「什么算内容推进」的判定表
+- `TestClassifyFrameClassification` — 固定「什么算内容推进」的判定表（该判定后来
+  从 `frameProgress` 布尔升级为 `classifyFrame` 四分类，见
+  [截断的 chat 流补写终止帧](2026-09-15-truncated-chat-stream-terminal-frame.md)）
 - `TestNoDataLossWithHeartbeatsInterleaved` — 心跳与内容交错时不得丢内容
   （行扫描残留处理不当会吃掉相邻行）
 

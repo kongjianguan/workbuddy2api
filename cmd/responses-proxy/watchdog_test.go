@@ -285,3 +285,168 @@ func keysOf(m map[string]bool) []string {
 	}
 	return out
 }
+
+// TestChatTruncatedStreamGetsTerminalFrame 是「截断流缺终止帧」的回归测试。
+//
+// 上游发出部分内容后被看门狗掐断时，旧实现只是关连接。客户端拿到的是一片
+// 没有 [DONE]、也没有 finish_reason 的裸 SSE，只能把「截断」读成协议异常：
+// DSH 的 parseSse 在流结束时缺 [DONE] 会直接抛 STREAM_CLOSED，用户看到的是
+// 报错而不是可重试的失败。
+//
+// 断言：截断后必须补出 finish_reason 与 [DONE]；且 finish_reason 不得是
+// "stop"——那等于把残缺回答谎报成完整回答。
+func TestChatTruncatedStreamGetsTerminalFrame(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl, _ := w.(http.Flusher)
+		_, _ = io.WriteString(w, "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n")
+		if fl != nil {
+			fl.Flush()
+		}
+		// 有内容之后只发心跳，永不推进、永不结束。
+		for i := 0; i < 60; i++ {
+			_, _ = io.WriteString(w, ": heartbeat\n\n")
+			if fl != nil {
+				fl.Flush()
+			}
+			time.Sleep(40 * time.Millisecond)
+		}
+	}))
+	defer up.Close()
+
+	u, _ := url.Parse(up.URL)
+	s := &server{
+		upstream:        u,
+		watchdogTimeout: 150 * time.Millisecond,
+		idleTimeout:     250 * time.Millisecond,
+		maxRetries:      0,
+		client:          &http.Client{Timeout: 20 * time.Second},
+	}
+
+	body := `{"model":"m","stream":true,"messages":[{"role":"user","content":"go"}]}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.chatCompletions(rec, req)
+
+	out := rec.Body.String()
+	if !strings.Contains(out, "partial") {
+		t.Errorf("已到达的内容应当透传:\n%s", out)
+	}
+	if !strings.Contains(out, "data: [DONE]") {
+		t.Errorf("截断流必须补 [DONE]，否则客户端报 STREAM_CLOSED:\n%s", out)
+	}
+	if !strings.Contains(out, `"finish_reason":"timeout"`) {
+		t.Errorf("截断流必须补非成功的 finish_reason:\n%s", out)
+	}
+	if strings.Contains(out, `"finish_reason":"stop"`) {
+		t.Errorf("不得把截断谎报成正常结束（finish_reason=stop）:\n%s", out)
+	}
+}
+
+// TestChatUpstreamFinishWithoutDoneOnlyGetsSentinel 覆盖「上游发了 finish_reason
+// 但缺 [DONE]」的情形。
+//
+// 此时上游已声明了真实结束原因（这里是 length，即被截断），补帧必须只补哨兵；
+// 若再补一个 finish_reason=timeout 就会覆盖上游的真实语义。
+func TestChatUpstreamFinishWithoutDoneOnlyGetsSentinel(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl, _ := w.(http.Flusher)
+		_, _ = io.WriteString(w, "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n")
+		if fl != nil {
+			fl.Flush()
+		}
+		// 发完 finish 就挂死，且从不发 [DONE]。
+		for i := 0; i < 60; i++ {
+			time.Sleep(40 * time.Millisecond)
+		}
+	}))
+	defer up.Close()
+
+	u, _ := url.Parse(up.URL)
+	s := &server{
+		upstream:        u,
+		watchdogTimeout: 150 * time.Millisecond,
+		idleTimeout:     250 * time.Millisecond,
+		maxRetries:      0,
+		client:          &http.Client{Timeout: 20 * time.Second},
+	}
+
+	body := `{"model":"m","stream":true,"messages":[{"role":"user","content":"go"}]}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.chatCompletions(rec, req)
+
+	out := rec.Body.String()
+	if !strings.Contains(out, "data: [DONE]") {
+		t.Errorf("缺 [DONE] 时必须补哨兵:\n%s", out)
+	}
+	if !strings.Contains(out, `"finish_reason":"length"`) {
+		t.Errorf("必须保留上游声明的 finish_reason:\n%s", out)
+	}
+	if strings.Contains(out, `"finish_reason":"timeout"`) {
+		t.Errorf("不得用本地怀疑覆盖上游已声明的结束原因:\n%s", out)
+	}
+	if strings.Count(out, "finish_reason") != 1 {
+		t.Errorf("finish_reason 应恰好出现一次，实际 %d 次:\n%s", strings.Count(out, "finish_reason"), out)
+	}
+}
+
+// TestChatNormalStreamNotDoubleTerminated 正常流不得被补帧。
+func TestChatNormalStreamNotDoubleTerminated(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer up.Close()
+
+	u, _ := url.Parse(up.URL)
+	s := &server{
+		upstream:        u,
+		watchdogTimeout: 2 * time.Second,
+		idleTimeout:     2 * time.Second,
+		maxRetries:      0,
+		client:          &http.Client{Timeout: 20 * time.Second},
+	}
+
+	body := `{"model":"m","stream":true,"messages":[{"role":"user","content":"go"}]}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.chatCompletions(rec, req)
+
+	out := rec.Body.String()
+	if got := strings.Count(out, "data: [DONE]"); got != 1 {
+		t.Errorf("[DONE] 应恰好出现 1 次，实际 %d 次:\n%s", got, out)
+	}
+	if strings.Contains(out, `"finish_reason":"timeout"`) {
+		t.Errorf("正常结束的流不得被补 timeout:\n%s", out)
+	}
+}
+
+// TestClassifyFrameClassification 固定「一行属于哪一类」的判定表。
+func TestClassifyFrameClassification(t *testing.T) {
+	cases := []struct {
+		line string
+		want frameKind
+	}{
+		{": heartbeat", frameOther},
+		{"", frameOther},
+		{"data: [DONE]", frameDone},
+		{`data: {"choices":[{"delta":{"role":"assistant"}}]}`, frameOther},
+		{`data: {"choices":[{"delta":{"content":"x"}}]}`, frameContent},
+		{`data: {"choices":[{"delta":{"reasoning_content":"x"}}]}`, frameContent},
+		{`data: {"choices":[{"delta":{"tool_calls":[{"index":0}]}}]}`, frameContent},
+		{`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}`, frameFinish},
+		{`data: {"choices":[],"usage":{"completion_tokens":0}}`, frameOther},
+		// 同时带内容与 finish_reason 时，内容优先——它是真实推进。
+		{`data: {"choices":[{"delta":{"content":"x"},"finish_reason":"stop"}]}`, frameContent},
+	}
+	for _, c := range cases {
+		if got := classifyFrame(c.line); got != c.want {
+			t.Errorf("classifyFrame(%q) = %v, want %v", c.line, got, c.want)
+		}
+	}
+}
