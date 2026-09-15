@@ -25,6 +25,30 @@ import (
 	"workbuddy2api/internal/responses"
 )
 
+// upstreamHeaderTimeout 是「等待上游响应头」的上限，覆盖看门狗够不到的阶段。
+//
+// 看门狗（-watchdog-timeout / -stream-idle-timeout）都要等拿到响应头才开始计时：
+// `client.Do` 尚未返回时没有 body 可读，两道闸门都不在跑。上游连响应头都不给时
+// （腾讯侧表现为排队静默或半开连接），唯一的上限就是这个传输层超时。
+//
+// 取值 45s 与网关的 `header_timeout_seconds` 对齐。链路是
+// 代理 → manager → 网关 → 腾讯，网关自己就在 45s 上掐，代理再宽也只是把
+// 「中间那跳本身卡住」的情形拖长。实测正常首字节 1.5~5.7s，45s 留足余量。
+const upstreamHeaderTimeout = 45 * time.Second
+
+// newUpstreamClient 构造转发到上游网关的 HTTP 客户端。
+//
+// 独立成函数而非内联在 main()，是为了让「等头超时真的生效」可被测试断言——
+// 内联时该上限没有任何测试覆盖，回归会静默发生。
+func newUpstreamClient(headerTimeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: 0, // 流式聊天无总时长上限
+		Transport: &http.Transport{
+			ResponseHeaderTimeout: headerTimeout,
+		},
+	}
+}
+
 func main() {
 	listen := flag.String("listen", ":7865", "listen address")
 	upstream := flag.String("upstream", "http://127.0.0.1:7863", "chat-completions gateway base URL")
@@ -54,13 +78,8 @@ func main() {
 		idleTimeout:     *idleTimeout,
 		maxRetries:      *maxRetries,
 		dumper:          dumper,
-		client: &http.Client{
-			Timeout: 0, // 流式聊天无总时长上限
-			Transport: &http.Transport{
-				ResponseHeaderTimeout: 120 * time.Second,
-			},
-		},
-		proxy: httputil.NewSingleHostReverseProxy(u),
+		client:          newUpstreamClient(upstreamHeaderTimeout),
+		proxy:           httputil.NewSingleHostReverseProxy(u),
 	}
 	orig := s.proxy.Director
 	s.proxy.Director = func(r *http.Request) {
